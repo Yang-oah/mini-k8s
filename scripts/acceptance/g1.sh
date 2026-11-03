@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-# Runs only against a newly started, isolated etcd data directory. No existing
-# cluster is touched; the spawned process and test directory belong to this run.
+# 只启动本轮专用 etcd 和临时数据目录，不连接或修改已有集群。
+# 缺少依赖或真实存储不可用时返回 BLOCKED，不能以模拟结果代替验收。
 cd "$(dirname "$0")/../.." || exit 2
 for tool in go gofmt etcd curl sha256sum find sort xargs grep mktemp date mkdir rm sleep; do
   if ! command -v "$tool" >/dev/null 2>&1; then
@@ -17,6 +17,7 @@ tmp="$(mktemp -d)" || exit 2
 etcd_pid=''
 cleaned=false
 cleanup_result=NOT_RUN
+# 清理本轮启动的进程和目录，并在生成 PASS 报告之前核对结果。
 cleanup() {
   [[ "$cleaned" == true ]] && return 0
   local failed=false
@@ -30,7 +31,7 @@ cleanup() {
       failed=true
       kill -KILL "$etcd_pid" 2>/dev/null || true
     fi
-    # A process terminated by SIGTERM normally has a non-zero wait status.
+    # SIGTERM 结束的进程通常返回非零 wait 状态，不单独视为清理失败。
     if ! kill -0 "$etcd_pid" 2>/dev/null; then wait "$etcd_pid" 2>/dev/null || :; fi
   fi
   if ! rm -rf -- "$tmp" || [[ -e "$tmp" ]]; then failed=true; fi
@@ -50,6 +51,7 @@ endpoint="http://127.0.0.1:$client_port"
   printf 'source_sha256='; { find cmd internal -type f -print0 | sort -z | xargs -0 sha256sum; sha256sum go.mod go.sum; } | sha256sum
 } > "$out/environment.txt"
 
+# 端口上已有 etcd 时停止，避免误将既有集群当成本轮隔离环境。
 if curl --max-time 1 -fsS "$endpoint/health" >/dev/null 2>&1; then
   cleanup || true
   printf '# G1 acceptance\n\n- Result: BLOCKED\n- Reason: etcd endpoint is already occupied; choose unused ports.\n- Temporary directory cleanup: %s\n' "$cleanup_result" > "$out/G1.md"
@@ -74,16 +76,19 @@ if [[ "$result" == PASS ]]; then
   if ! go build -o "$tmp/mini-api" ./cmd/mini-api >"$out/build.log" 2>&1; then result=FAIL; reason='API build failed.'; fi
 fi
 if [[ "$result" == PASS ]]; then
+  # 使用真实 API 进程和上面启动的 etcd 执行六项集成检查。
   export G1_ETCD_ENDPOINT="$endpoint" G1_API_BINARY="$tmp/mini-api" G1_API_LOG="$out/api.log"
   if ! go test -count=1 -timeout=120s -v ./internal/acceptance >"$out/g1.log" 2>&1; then result=FAIL; reason='G1 assertions, startup, or cleanup failed; inspect g1.log.'; fi
 fi
 if [[ "$result" == PASS ]]; then
+  # 常规 Go 检查不重复运行需要独立环境变量的集成测试。
   unset G1_ETCD_ENDPOINT G1_API_BINARY G1_API_LOG
   if [[ -n "$(gofmt -l cmd internal)" ]]; then result=FAIL; reason='gofmt check failed.'; fi
   if ! go vet ./... >"$out/vet.log" 2>&1; then result=FAIL; reason='go vet failed.'; fi
   if ! go test -count=1 ./... >"$out/test.log" 2>&1; then result=FAIL; reason='go test failed.'; fi
   if ! go build ./... >"$out/build-all.log" 2>&1; then result=FAIL; reason='go build failed.'; fi
 fi
+# 无论检查成功或失败，先清理再写报告；清理失败不能报告 PASS。
 if ! cleanup; then
   if [[ "$result" == PASS ]]; then result=FAIL; fi
   reason="$reason Isolated etcd or temporary directory cleanup failed."
@@ -91,6 +96,7 @@ fi
 {
   printf '# G1 acceptance\n\n- Result: %s\n- Started (UTC): %s\n- Finished (UTC): %s\n- Command: scripts/acceptance/g1.sh\n- Environment and source checksum: environment.txt\n- Result details: %s\n\n' "$result" "$started" "$(date -u +%FT%TZ)" "$reason"
   printf '| Check | Result | Evidence |\n| --- | --- | --- |\n'
+  # 只依据测试输出标记各项，未执行的项目保留 NOT_RUN。
   for id in 01 02 03 04 05 06; do
     if [[ -f "$out/g1.log" ]] && grep -q -- "--- PASS: TestG1/G1-$id" "$out/g1.log"; then state=PASS
     elif [[ -f "$out/g1.log" ]] && grep -q -- "--- FAIL: TestG1/G1-$id" "$out/g1.log"; then state=FAIL

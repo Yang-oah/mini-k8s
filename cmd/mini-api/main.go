@@ -24,6 +24,7 @@ func main() {
 	if *cert == "" || *key == "" || *auth == "" {
 		log.Fatal("tls-cert, tls-key, and auth-file are required")
 	}
+	// 凭据从文件加载，避免将令牌放在进程参数中。
 	data, err := os.ReadFile(*auth)
 	if err != nil {
 		log.Fatal(err)

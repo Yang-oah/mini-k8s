@@ -1,4 +1,4 @@
-// Package cli implements the user-facing client for the mini API.
+// Package cli 实现面向用户的 mini API 客户端。
 package cli
 
 import (
@@ -108,7 +108,8 @@ type manifest struct {
 	object     map[string]any
 }
 
-// readManifests parses each document separately and validates its entire schema.
+// readManifests 逐个解析 YAML 文档，再使用 JSON 资源模型严格检查未知字段。
+// 全部文档先通过本地检查后才提交；多对象写入本身不具有事务性。
 func readManifests(r io.Reader) ([]manifest, error) {
 	data, err := io.ReadAll(io.LimitReader(r, (4<<20)+1))
 	if err != nil {
@@ -162,6 +163,7 @@ func readManifests(r io.Reader) ([]manifest, error) {
 		if name == "" || strings.ContainsAny(name, "/?#") {
 			return nil, fmt.Errorf("document %d: invalid metadata.name", i)
 		}
+		// 用户声明不能指定属于 API、控制器或 Agent 的字段。
 		for _, key := range []string{"uid", "resourceVersion", "ownerUID", "deletionTimestamp"} {
 			if _, found := meta[key]; found {
 				return nil, fmt.Errorf("document %d: metadata.%s is system managed", i, key)
@@ -199,6 +201,7 @@ func (c *client) apply(ctx context.Context, m manifest) error {
 	if err == nil {
 		var existing map[string]any
 		decoder := json.NewDecoder(bytes.NewReader(current))
+		// resourceVersion 是整数；避免转成 float64 后丢失精度。
 		decoder.UseNumber()
 		if err := decoder.Decode(&existing); err != nil {
 			return fmt.Errorf("decode current object: %w", err)
@@ -207,6 +210,8 @@ func (c *client) apply(ctx context.Context, m manifest) error {
 		if !ok {
 			return errors.New("current object has invalid metadata")
 		}
+		// 基于最新对象替换声明字段，保留 UID、版本、绑定和 status。
+		// API 用保留的 resourceVersion 检查并发冲突；此处不盲目重试。
 		newMeta := obj["metadata"].(map[string]any)
 		for _, key := range []string{"labels", "annotations"} {
 			if value, exists := newMeta[key]; exists {
@@ -216,7 +221,7 @@ func (c *client) apply(ctx context.Context, m manifest) error {
 			}
 		}
 		existing["spec"] = obj["spec"]
-		// ClusterIP belongs to the server and survives an apply.
+		// ClusterIP 由服务端分配，apply 时保留原值。
 		if m.collection == "services" {
 			var old map[string]any
 			if json.Unmarshal(current, &old) == nil {
@@ -249,7 +254,7 @@ func fileArg(args []string) (string, error) {
 	return *name, nil
 }
 
-// Run executes a CLI invocation. Global connection flags precede the command.
+// Run 执行一次 CLI 调用；全局连接参数必须位于子命令之前。
 func Run(ctx context.Context, args []string, out io.Writer) error {
 	f := flag.NewFlagSet("mini-k8s", flag.ContinueOnError)
 	f.SetOutput(io.Discard)
@@ -282,6 +287,7 @@ func Run(ctx context.Context, args []string, out io.Writer) error {
 		if err != nil {
 			return err
 		}
+		// 逐对象提交并输出已完成项；后续失败不会回滚之前的对象。
 		for _, m := range manifests {
 			if args[0] == "apply" {
 				err = c.apply(ctx, m)
@@ -333,6 +339,7 @@ func Run(ctx context.Context, args []string, out io.Writer) error {
 		}
 		var obj map[string]any
 		decoder := json.NewDecoder(bytes.NewReader(data))
+		// 保持版本整数原值，让服务端可靠检测读取后的并发修改。
 		decoder.UseNumber()
 		if err := decoder.Decode(&obj); err != nil {
 			return err

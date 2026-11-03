@@ -1,4 +1,5 @@
-// Package acceptance exercises the public API against a real etcd process.
+// Package acceptance 通过真实 API 进程和真实 etcd 验证控制面契约。
+// 缺少验收环境变量时测试会跳过；跳过不代表阶段验收通过。
 package acceptance
 
 import (
@@ -34,7 +35,8 @@ const sensitive = "g1-sensitive-env-value"
 
 type object map[string]any
 
-type fixture struct {
+// g1Fixture 管理本次测试的 API 进程、独立名称、凭据和连接。
+type g1Fixture struct {
 	t                                                               *testing.T
 	url, cert, key, auth, token, node, other, pod, rs, binary, etcd string
 	client                                                          *http.Client
@@ -42,7 +44,7 @@ type fixture struct {
 	log                                                             *os.File
 }
 
-func (f *fixture) start() {
+func (f *g1Fixture) start() {
 	f.t.Helper()
 	f.process = exec.Command(f.binary, "-listen", strings.TrimPrefix(f.url, "https://"), "-etcd", f.etcd, "-tls-cert", f.cert, "-tls-key", f.key, "-auth-file", f.auth)
 	f.process.Stdout, f.process.Stderr = f.log, f.log
@@ -60,7 +62,7 @@ func (f *fixture) start() {
 	f.t.Fatal("API did not become ready within 10 seconds")
 }
 
-func (f *fixture) stop() {
+func (f *g1Fixture) stop() {
 	f.t.Helper()
 	if f.process != nil && f.process.Process != nil {
 		_ = f.process.Process.Kill()
@@ -69,7 +71,7 @@ func (f *fixture) stop() {
 	}
 }
 
-func (f *fixture) request(method, path, token string, payload any) ([]byte, int, error) {
+func (f *g1Fixture) request(method, path, token string, payload any) ([]byte, int, error) {
 	var reader io.Reader
 	if payload != nil {
 		b, err := json.Marshal(payload)
@@ -97,7 +99,7 @@ func (f *fixture) request(method, path, token string, payload any) ([]byte, int,
 	return b, resp.StatusCode, err
 }
 
-func (f *fixture) call(method, path, token string, payload any, code int) object {
+func (f *g1Fixture) call(method, path, token string, payload any, code int) object {
 	f.t.Helper()
 	b, got, err := f.request(method, path, token, payload)
 	if err != nil || got != code {
@@ -112,20 +114,37 @@ func (f *fixture) call(method, path, token string, payload any, code int) object
 	return out
 }
 
-func meta(o object) object { return object(o["metadata"].(map[string]any)) }
-func spec(o object) object { return object(o["spec"].(map[string]any)) }
-func rv(o object) float64  { return meta(o)["resourceVersion"].(float64) }
-func id(o object) string   { return meta(o)["uid"].(string) }
+func metadataOf(o object) object         { return object(o["metadata"].(map[string]any)) }
+func specOf(o object) object             { return object(o["spec"].(map[string]any)) }
+func resourceVersionOf(o object) float64 { return metadataOf(o)["resourceVersion"].(float64) }
+func uidOf(o object) string              { return metadataOf(o)["uid"].(string) }
 
-func pod(name string) object {
-	return object{"apiVersion": "mini.k8s/v1", "kind": "Pod", "metadata": object{"name": name}, "spec": object{"image": "example.invalid/demo:fixed", "restartPolicy": "Always", "env": object{"SENSITIVE": sensitive}, "resources": object{"requests": object{"cpuMilli": 100, "memoryBytes": 1024}, "limits": object{"cpuMilli": 200, "memoryBytes": 2048}}, "readiness": object{"port": 8080}}}
+func podManifest(name string) object {
+	return object{
+		"apiVersion": "mini.k8s/v1", "kind": "Pod", "metadata": object{"name": name},
+		"spec": object{
+			"image": "example.invalid/demo:fixed", "restartPolicy": "Always",
+			"env": object{"SENSITIVE": sensitive},
+			"resources": object{
+				"requests": object{"cpuMilli": 100, "memoryBytes": 1024},
+				"limits":   object{"cpuMilli": 200, "memoryBytes": 2048},
+			},
+			"readiness": object{"port": 8080},
+		},
+	}
 }
-func replica(name string) object {
-	p := pod(name)
-	return object{"apiVersion": "mini.k8s/v1", "kind": "ReplicaSet", "metadata": object{"name": name}, "spec": object{"replicas": 1, "selector": object{"app": name}, "template": object{"labels": object{"app": name}, "spec": p["spec"]}}}
+func replicaSetManifest(name string) object {
+	p := podManifest(name)
+	return object{
+		"apiVersion": "mini.k8s/v1", "kind": "ReplicaSet", "metadata": object{"name": name},
+		"spec": object{
+			"replicas": 1, "selector": object{"app": name},
+			"template": object{"labels": object{"app": name}, "spec": p["spec"]},
+		},
+	}
 }
 
-func (f *fixture) runCLI(args ...string) {
+func (f *g1Fixture) runCLI(args ...string) {
 	f.t.Helper()
 	var out bytes.Buffer
 	args = append([]string{"--server", f.url, "--ca-file", f.cert, "--token-file", f.token}, args...)
@@ -136,7 +155,7 @@ func (f *fixture) runCLI(args ...string) {
 	}
 }
 
-func (f *fixture) manifest(v object) string {
+func (f *g1Fixture) manifest(v object) string {
 	f.t.Helper()
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -149,7 +168,9 @@ func (f *fixture) manifest(v object) string {
 	return file
 }
 
-func (f *fixture) cleanup() {
+// cleanup 只经正式 API 清理本轮对象；已绑定 Pod 须由节点身份确认清理。
+// 若无法确认 Pod 已消失，保留节点，避免破坏后续排查和恢复所需的预留信息。
+func (f *g1Fixture) cleanup() {
 	podCleared := true
 	for _, name := range []string{f.pod} {
 		b, code, err := f.request("GET", "pods/"+name, admin, nil)
@@ -178,7 +199,7 @@ func (f *fixture) cleanup() {
 			b, code, err = f.request("GET", "pods/"+name, admin, nil)
 			if err == nil && code == 200 {
 				_ = json.Unmarshal(b, &p)
-				_, code, err = f.request("POST", "pods/"+name+"/cleanup", agent, object{"uid": id(p), "resourceVersion": rv(p)})
+				_, code, err = f.request("POST", "pods/"+name+"/cleanup", agent, object{"uid": uidOf(p), "resourceVersion": resourceVersionOf(p)})
 				if err != nil || code != 200 {
 					f.t.Errorf("cleanup bound Pod: HTTP %d %v", code, err)
 				}
@@ -208,7 +229,8 @@ func (f *fixture) cleanup() {
 	}
 }
 
-func setup(t *testing.T) *fixture {
+// setupG1 启动独立 API 进程，连接调用者提供的真实 etcd；证书和凭据仅供本轮使用。
+func setupG1(t *testing.T) *g1Fixture {
 	t.Helper()
 	endpoint, binary := os.Getenv("G1_ETCD_ENDPOINT"), os.Getenv("G1_API_BINARY")
 	if endpoint == "" || binary == "" {
@@ -216,7 +238,7 @@ func setup(t *testing.T) *fixture {
 	}
 	dir := t.TempDir()
 	suffix := fmt.Sprintf("%x", time.Now().UnixNano())
-	f := &fixture{t: t, etcd: endpoint, binary: binary, node: "g1-node-" + suffix, other: "g1-other-" + suffix, pod: "g1-pod-" + suffix, rs: "g1-rs-" + suffix}
+	f := &g1Fixture{t: t, etcd: endpoint, binary: binary, node: "g1-node-" + suffix, other: "g1-other-" + suffix, pod: "g1-pod-" + suffix, rs: "g1-rs-" + suffix}
 	f.cert = filepath.Join(dir, "ca.pem")
 	f.key = filepath.Join(dir, "server-key.pem")
 	f.auth = filepath.Join(dir, "auth.json")
@@ -264,48 +286,51 @@ func setup(t *testing.T) *fixture {
 }
 
 func TestG1(t *testing.T) {
-	f := setup(t)
+	f := setupG1(t)
+	// G1-01：通过正式 CLI 验证声明、伸缩、重复提交及同名重建。
 	if !t.Run("G1-01_CRUD", func(t *testing.T) {
 		f.t = t
-		pm, rm := f.manifest(pod(f.pod)), f.manifest(replica(f.rs))
-		f.runCLI("apply", "-f", pm)
-		f.runCLI("apply", "-f", rm)
+		podFile, replicaSetFile := f.manifest(podManifest(f.pod)), f.manifest(replicaSetManifest(f.rs))
+		f.runCLI("apply", "-f", podFile)
+		f.runCLI("apply", "-f", replicaSetFile)
 		p := f.call("GET", "pods/"+f.pod, admin, nil, 200)
-		oldUID := id(p)
-		f.runCLI("apply", "-f", pm)
-		if id(f.call("GET", "pods/"+f.pod, admin, nil, 200)) != oldUID {
+		oldUID := uidOf(p)
+		f.runCLI("apply", "-f", podFile)
+		if uidOf(f.call("GET", "pods/"+f.pod, admin, nil, 200)) != oldUID {
 			t.Fatal("repeat apply changed UID")
 		}
 		f.runCLI("get", "pod", f.pod)
 		f.runCLI("scale", "rs", f.rs, "--replicas", "3")
 		rs := f.call("GET", "replicasets/"+f.rs, admin, nil, 200)
-		if spec(rs)["replicas"] != float64(3) {
+		if specOf(rs)["replicas"] != float64(3) {
 			t.Fatal("scale not persisted")
 		}
-		f.runCLI("delete", "-f", rm)
+		f.runCLI("delete", "-f", replicaSetFile)
 		f.call("GET", "replicasets/"+f.rs, admin, nil, 404)
-		f.runCLI("apply", "-f", rm)
-		f.runCLI("delete", "-f", pm)
-		f.runCLI("delete", "-f", pm)
-		f.runCLI("apply", "-f", pm)
-		if id(f.call("GET", "pods/"+f.pod, admin, nil, 200)) == oldUID {
+		f.runCLI("apply", "-f", replicaSetFile)
+		f.runCLI("delete", "-f", podFile)
+		f.runCLI("delete", "-f", podFile)
+		f.runCLI("apply", "-f", podFile)
+		if uidOf(f.call("GET", "pods/"+f.pod, admin, nil, 200)) == oldUID {
 			t.Fatal("recreated Pod retained UID")
 		}
 	}) {
 		return
 	}
+	// G1-02：重启 API 进程后，etcd 中的 UID、规格和状态仍可读。
 	if !t.Run("G1-02_persistence", func(t *testing.T) {
 		f.t = t
 		before := f.call("GET", "pods/"+f.pod, admin, nil, 200)
 		f.stop()
 		f.start()
 		after := f.call("GET", "pods/"+f.pod, admin, nil, 200)
-		if id(before) != id(after) || fmt.Sprint(before["spec"]) != fmt.Sprint(after["spec"]) || fmt.Sprint(before["status"]) != fmt.Sprint(after["status"]) {
+		if uidOf(before) != uidOf(after) || fmt.Sprint(before["spec"]) != fmt.Sprint(after["spec"]) || fmt.Sprint(before["status"]) != fmt.Sprint(after["status"]) {
 			t.Fatal("restart changed persisted state")
 		}
 	}) {
 		return
 	}
+	// G1-03：相同旧版本并发写入只能成功一次；非法字段不得改变对象。
 	if !t.Run("G1-03_CAS_fields", func(t *testing.T) {
 		f.t = t
 		rs := f.call("GET", "replicasets/"+f.rs, admin, nil, 200)
@@ -313,8 +338,8 @@ func TestG1(t *testing.T) {
 		var a, b object
 		_ = json.Unmarshal(data, &a)
 		_ = json.Unmarshal(data, &b)
-		spec(a)["replicas"] = float64(2)
-		spec(b)["replicas"] = float64(4)
+		specOf(a)["replicas"] = float64(2)
+		specOf(b)["replicas"] = float64(4)
 		ch := make(chan int, 2)
 		for _, v := range []object{a, b} {
 			go func(v object) {
@@ -332,13 +357,13 @@ func TestG1(t *testing.T) {
 		}
 		p := f.call("GET", "pods/"+f.pod, admin, nil, 200)
 		before, _ := json.Marshal(p)
-		spec(p)["unknown"] = true
+		specOf(p)["unknown"] = true
 		f.call("PUT", "pods/"+f.pod, admin, p, 400)
 		_ = json.Unmarshal(before, &p)
-		spec(p)["image"] = "modified"
+		specOf(p)["image"] = "modified"
 		f.call("PUT", "pods/"+f.pod, admin, p, 400)
 		_ = json.Unmarshal(before, &p)
-		f.call("PUT", "pods/"+f.pod+"/status", admin, object{"resourceVersion": rv(p), "status": object{"phase": "Running"}}, 403)
+		f.call("PUT", "pods/"+f.pod+"/status", admin, object{"resourceVersion": resourceVersionOf(p), "status": object{"phase": "Running"}}, 403)
 		after, _ := json.Marshal(f.call("GET", "pods/"+f.pod, admin, nil, 200))
 		if !bytes.Equal(before, after) {
 			t.Fatal("rejected writes changed resource")
@@ -346,13 +371,14 @@ func TestG1(t *testing.T) {
 	}) {
 		return
 	}
+	// G1-04：先 List 再修改并 Watch，断开后从已处理版本重连。
 	if !t.Run("G1-04_list_watch", func(t *testing.T) {
 		f.t = t
 		list := f.call("GET", "pods", admin, nil, 200)
 		version := int64(list["resourceVersion"].(float64))
 		for i := 0; i < 2; i++ {
 			p := f.call("GET", "pods/"+f.pod, admin, nil, 200)
-			meta(p)["annotations"] = object{"watch": fmt.Sprint(i)}
+			metadataOf(p)["annotations"] = object{"watch": fmt.Sprint(i)}
 			f.call("PUT", "pods/"+f.pod, admin, p, 200)
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			req, _ := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/api/mini/v1/pods?watch=true&resourceVersion=%d", f.url, version), nil)
@@ -370,7 +396,7 @@ func TestG1(t *testing.T) {
 				t.Fatalf("watch: HTTP %d, %v", resp.StatusCode, err)
 			}
 			observed, ok := event["object"].(map[string]any)
-			if !ok || meta(object(observed))["name"] != f.pod || meta(object(observed))["annotations"].(map[string]any)["watch"] != fmt.Sprint(i) {
+			if !ok || metadataOf(object(observed))["name"] != f.pod || metadataOf(object(observed))["annotations"].(map[string]any)["watch"] != fmt.Sprint(i) {
 				t.Fatalf("wrong watch event: %v", event)
 			}
 			version = int64(event["resourceVersion"].(float64))
@@ -378,15 +404,16 @@ func TestG1(t *testing.T) {
 	}) {
 		return
 	}
+	// G1-05：用模拟节点状态和正式绑定接口验证授权、幂等与资源预留。
 	if !t.Run("G1-05_binding", func(t *testing.T) {
 		f.t = t
 		for _, name := range []string{f.node, f.other} {
 			f.call("POST", "nodes", admin, object{"apiVersion": "mini.k8s/v1", "kind": "Node", "metadata": object{"name": name}, "spec": object{"allocatable": object{"cpuMilli": 1000, "memoryBytes": 100000}, "podCIDR": "10.8.0.0/24"}}, 201)
 		}
 		n := f.call("GET", "nodes/"+f.node, admin, nil, 200)
-		f.call("PUT", "nodes/"+f.node+"/status", agent, object{"resourceVersion": rv(n), "status": object{"ready": true, "reserved": object{"cpuMilli": 0, "memoryBytes": 0}}}, 200)
+		f.call("PUT", "nodes/"+f.node+"/status", agent, object{"resourceVersion": resourceVersionOf(n), "status": object{"ready": true, "reserved": object{"cpuMilli": 0, "memoryBytes": 0}}}, 200)
 		p := f.call("GET", "pods/"+f.pod, admin, nil, 200)
-		req := object{"nodeName": f.node, "nodeUID": id(n), "podUID": id(p), "resourceVersion": rv(p)}
+		req := object{"nodeName": f.node, "nodeUID": uidOf(n), "podUID": uidOf(p), "resourceVersion": resourceVersionOf(p)}
 		f.call("POST", "pods/"+f.pod+"/bind", admin, req, 403)
 		f.call("POST", "pods/"+f.pod+"/bind", scheduler, req, 200)
 		f.call("POST", "pods/"+f.pod+"/bind", scheduler, req, 200)
@@ -398,23 +425,24 @@ func TestG1(t *testing.T) {
 		}
 		p = f.call("GET", "pods/"+f.pod, admin, nil, 200)
 		before := p["spec"]
-		f.call("PUT", "pods/"+f.pod+"/status", agent, object{"resourceVersion": rv(p), "status": object{"phase": "Running"}}, 200)
+		f.call("PUT", "pods/"+f.pod+"/status", agent, object{"resourceVersion": resourceVersionOf(p), "status": object{"phase": "Running"}}, 200)
 		p = f.call("GET", "pods/"+f.pod, admin, nil, 200)
 		if fmt.Sprint(before) != fmt.Sprint(p["spec"]) {
 			t.Fatal("status update modified spec")
 		}
 		f.call("DELETE", "pods/"+f.pod, admin, nil, 200)
 		p = f.call("GET", "pods/"+f.pod, admin, nil, 200)
-		req["resourceVersion"] = rv(p)
+		req["resourceVersion"] = resourceVersionOf(p)
 		f.call("POST", "pods/"+f.pod+"/bind", scheduler, req, 409)
 	}) {
 		return
 	}
+	// G1-06：验证缺少凭据、跨节点越权，以及日志中的必要字段和脱敏。
 	t.Run("G1-06_auth_log", func(t *testing.T) {
 		f.t = t
 		f.call("GET", "pods", "", nil, 401)
 		n := f.call("GET", "nodes/"+f.node, admin, nil, 200)
-		f.call("PUT", "nodes/"+f.node+"/status", otherAgent, object{"resourceVersion": rv(n), "status": object{"ready": true}}, 403)
+		f.call("PUT", "nodes/"+f.node+"/status", otherAgent, object{"resourceVersion": resourceVersionOf(n), "status": object{"ready": true}}, 403)
 		data, err := os.ReadFile(f.log.Name())
 		if err != nil {
 			t.Fatal(err)

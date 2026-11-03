@@ -11,7 +11,7 @@ import (
 
 var resourceName = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
 
-// DecodeStrict rejects unknown fields and additional JSON values.
+// DecodeStrict 只接受一个 JSON 值，并拒绝资源模型未定义的字段。
 func DecodeStrict(r io.Reader, dst any) error {
 	d := json.NewDecoder(r)
 	d.DisallowUnknownFields()
@@ -58,6 +58,7 @@ func validatePodSpec(s PodSpec) error {
 	return nil
 }
 
+// ValidatePod 校验 Pod 类型、元数据和单容器资源要求。
 func ValidatePod(p Pod) error {
 	if p.APIVersion != Version || p.Kind != "Pod" {
 		return errors.New("invalid apiVersion or kind for Pod")
@@ -68,6 +69,7 @@ func ValidatePod(p Pod) error {
 	return validatePodSpec(p.Spec)
 }
 
+// ValidateReplicaSet 校验副本数、选择器以及模板与选择器的一致性。
 func ValidateReplicaSet(rs ReplicaSet) error {
 	if rs.APIVersion != Version || rs.Kind != "ReplicaSet" {
 		return errors.New("invalid apiVersion or kind for ReplicaSet")
@@ -86,7 +88,7 @@ func ValidateReplicaSet(rs ReplicaSet) error {
 	return validatePodSpec(rs.Spec.Template.Spec)
 }
 
-// ValidatePodUpdate checks immutable fields; authorization and CAS are separate.
+// ValidatePodUpdate 检查 Pod 不可变字段；鉴权、status 隔离和版本比较由调用方负责。
 func ValidatePodUpdate(old, next Pod) error {
 	if err := ValidatePod(next); err != nil {
 		return err
@@ -100,6 +102,7 @@ func ValidatePodUpdate(old, next Pod) error {
 	return nil
 }
 
+// ValidateReplicaSetUpdate 拒绝修改已有 ReplicaSet 的选择器和模板。
 func ValidateReplicaSetUpdate(old, next ReplicaSet) error {
 	if err := ValidateReplicaSet(next); err != nil {
 		return err
