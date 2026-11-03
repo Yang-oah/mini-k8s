@@ -9,7 +9,7 @@ import (
 )
 
 func TestAuthenticationAndWriteAuthorization(t *testing.T) {
-	s := &Server{Credentials: Credentials{Admin: "admin-token", Scheduler: "scheduler-token", Agents: map[string]string{"node-a": "agent-token"}}}
+	s := &Server{Credentials: Credentials{Admin: "admin-token", Controller: "controller-token", Scheduler: "scheduler-token", Agents: map[string]string{"node-a": "agent-token"}}}
 	tests := []struct {
 		token, method, path string
 		want                int
@@ -21,6 +21,9 @@ func TestAuthenticationAndWriteAuthorization(t *testing.T) {
 		{"admin-token", "PUT", "/api/mini/v1/pods/p/status", 403},
 		{"scheduler-token", "PUT", "/api/mini/v1/nodes/n/status", 403},
 		{"agent-token", "GET", "/api/mini/v1/pods?watch=true&resourceVersion=1", 403},
+		{"admin-token", "POST", "/api/mini/v1/replicasets/rs/finalize", 403},
+		{"controller-token", "PUT", "/api/mini/v1/pods/p", 403},
+		{"controller-token", "DELETE", "/api/mini/v1/replicasets/rs", 403},
 	}
 	for _, tt := range tests {
 		t.Run(tt.token+tt.method+tt.path, func(t *testing.T) {

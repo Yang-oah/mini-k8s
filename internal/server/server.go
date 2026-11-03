@@ -228,11 +228,21 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.cleanup(w, r, name, who, respondError)
 		return
 	}
+	if action == "finalize" {
+		if who.role != "controller" || r.Method != "POST" || kind != "replicasets" || name == "" {
+			respondError(403, "Forbidden", "finalize requires the controller identity")
+			return
+		}
+		s.finalizeReplicaSet(w, r, name, respondError)
+		return
+	}
 	if action != "" {
 		respondError(404, "NotFound", "unknown action")
 		return
 	}
-	if r.Method != "GET" && who.role != "admin" && !(who.role == "controller" && kind == "pods") {
+	controllerPodWrite := who.role == "controller" && kind == "pods" &&
+		((r.Method == "POST" && name == "") || (r.Method == "DELETE" && name != ""))
+	if r.Method != "GET" && who.role != "admin" && !controllerPodWrite {
 		respondError(403, "Forbidden", "write not authorized")
 		return
 	}
@@ -289,7 +299,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == "POST" && name == "" {
 		status = http.StatusCreated
-		s.create(ctx, w, r, kind, respondError)
+		s.create(ctx, w, r, kind, who, respondError)
 		return
 	}
 	if r.Method == "PUT" && name != "" {
@@ -297,7 +307,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == "DELETE" && name != "" {
-		s.delete(ctx, w, kind, name, respondError)
+		s.delete(ctx, w, r, kind, name, who, respondError)
 		return
 	}
 	respondError(405, "MethodNotAllowed", "unsupported method")

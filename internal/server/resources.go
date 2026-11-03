@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"reflect"
 	"time"
@@ -11,7 +12,7 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
-func (s *Server) create(ctx context.Context, w http.ResponseWriter, r *http.Request, kind string, respondError errorResponder) {
+func (s *Server) create(ctx context.Context, w http.ResponseWriter, r *http.Request, kind string, who identity, respondError errorResponder) {
 	o, _ := newObject(kind)
 	if err := decodeBody(r, o); err != nil {
 		respondError(400, "Invalid", err.Error())
@@ -21,8 +22,13 @@ func (s *Server) create(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		respondError(400, "Invalid", err.Error())
 		return
 	}
-	if o.meta.UID != "" || o.meta.ResourceVersion != 0 || o.meta.DeletionTimestamp != nil || o.meta.OwnerUID != "" {
+	if o.meta.UID != "" || o.meta.ResourceVersion != 0 || o.meta.DeletionTimestamp != nil ||
+		(o.meta.OwnerUID != "" && (who.role != "controller" || kind != "pods")) {
 		respondError(400, "Invalid", "system metadata must be empty")
+		return
+	}
+	if who.role == "controller" && o.meta.OwnerUID == "" {
+		respondError(400, "Invalid", "controller-created Pod requires ownerUID")
 		return
 	}
 	switch v := o.value.(type) {
@@ -86,10 +92,16 @@ func (s *Server) create(ctx context.Context, w http.ResponseWriter, r *http.Requ
 				break
 			}
 		}
+	} else if who.role == "controller" {
+		tx, err = s.createOwnedPod(ctx, k, o)
 	} else {
 		tx, err = s.Client.Txn(ctx).If(clientv3.Compare(clientv3.Version(k), "=", 0)).Then(clientv3.OpPut(k, encodeObject(o))).Commit()
 	}
 	if err != nil {
+		if errors.Is(err, errOwnerUnavailable) {
+			respondError(409, "Conflict", "owner ReplicaSet missing or deleting")
+			return
+		}
 		respondError(503, "Unavailable", "storage unavailable")
 		return
 	}
@@ -196,7 +208,7 @@ func (s *Server) update(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	writeJSON(w, next.value)
 }
 
-func (s *Server) delete(ctx context.Context, w http.ResponseWriter, kind, name string, respondError errorResponder) {
+func (s *Server) delete(ctx context.Context, w http.ResponseWriter, r *http.Request, kind, name string, who identity, respondError errorResponder) {
 	k := resourceKey(kind, name)
 	get, err := s.Client.Get(ctx, k)
 	if err != nil {
@@ -213,6 +225,14 @@ func (s *Server) delete(ctx context.Context, w http.ResponseWriter, kind, name s
 		return
 	}
 	setAuditUID(ctx, old.meta.UID)
+	if who.role == "controller" && (old.meta.OwnerUID == "" || r.URL.Query().Get("uid") == "" || r.URL.Query().Get("uid") != old.meta.UID) {
+		respondError(403, "Forbidden", "controller requires matching owned Pod UID")
+		return
+	}
+	if kind == "replicasets" {
+		s.deleteReplicaSet(ctx, w, old, respondError)
+		return
+	}
 	op := clientv3.OpDelete(k)
 	// 已绑定 Pod 必须保留删除标记，直到对应节点确认清理并释放预留。
 	if p, ok := old.value.(*api.Pod); ok && p.NodeUID != "" {
@@ -222,11 +242,7 @@ func (s *Server) delete(ctx context.Context, w http.ResponseWriter, kind, name s
 		}
 		op = clientv3.OpPut(k, encodeObject(old))
 	}
-	ops := []clientv3.Op{op}
-	if kind == "replicasets" {
-		ops = append(ops, clientv3.OpPut(prefix+"replicaset-selector-revision", newUID()))
-	}
-	res, err := s.Client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(k), "=", old.meta.ResourceVersion)).Then(ops...).Commit()
+	res, err := s.Client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(k), "=", old.meta.ResourceVersion)).Then(op).Commit()
 	if err != nil {
 		respondError(503, "Unavailable", "storage unavailable")
 		return
