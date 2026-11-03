@@ -1,0 +1,16 @@
+=== RUN   TestG1
+=== RUN   TestG1/G1-01_CRUD
+=== RUN   TestG1/G1-02_persistence
+=== RUN   TestG1/G1-03_CAS_fields
+=== RUN   TestG1/G1-04_list_watch
+=== RUN   TestG1/G1-05_binding
+=== RUN   TestG1/G1-06_auth_log
+--- PASS: TestG1 (2.54s)
+    --- PASS: TestG1/G1-01_CRUD (1.03s)
+    --- PASS: TestG1/G1-02_persistence (0.25s)
+    --- PASS: TestG1/G1-03_CAS_fields (0.03s)
+    --- PASS: TestG1/G1-04_list_watch (0.18s)
+    --- PASS: TestG1/G1-05_binding (0.12s)
+    --- PASS: TestG1/G1-06_auth_log (0.01s)
+PASS
+ok  	mini-k8s/internal/acceptance	2.898s

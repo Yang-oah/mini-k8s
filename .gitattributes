@@ -1,0 +1,5 @@
+# Go 源码与 shell 脚本在不同平台统一使用 LF，保证 gofmt 和脚本入口一致。
+*.go text eol=lf
+*.sh text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf

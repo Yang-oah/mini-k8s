@@ -1,0 +1,22 @@
+apiVersion: mini.k8s/v1
+kind: ReplicaSet
+metadata:
+  name: example-rs
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    app: example-rs
+  template:
+    labels:
+      app: example-rs
+    spec:
+      image: example.invalid/example:replace-me
+      restartPolicy: Always
+      resources:
+        requests:
+          cpuMilli: 50
+          memoryBytes: 67108864
+        limits:
+          cpuMilli: 100
+          memoryBytes: 134217728

@@ -1,0 +1,249 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"mini-k8s/internal/api"
+
+	clientv3 "go.etcd.io/etcd/client/v3"
+)
+
+type bindRequest struct {
+	NodeName        string `json:"nodeName"`
+	NodeUID         string `json:"nodeUID"`
+	PodUID          string `json:"podUID"`
+	ResourceVersion int64  `json:"resourceVersion"`
+}
+
+func (s *Server) bind(w http.ResponseWriter, r *http.Request, name string, respondError errorResponder) {
+	var req bindRequest
+	if err := api.DecodeStrict(io.LimitReader(r.Body, 1<<20), &req); err != nil {
+		respondError(400, "Invalid", err.Error())
+		return
+	}
+	if req.NodeName == "" || req.NodeUID == "" || req.PodUID == "" || req.ResourceVersion <= 0 {
+		respondError(400, "Invalid", "binding identifiers and version required")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	for attempt := 0; attempt < 5; attempt++ {
+		response, err := s.Client.Txn(ctx).Then(clientv3.OpGet(resourceKey("pods", name)), clientv3.OpGet(resourceKey("nodes", req.NodeName))).Commit()
+		if err != nil {
+			respondError(503, "Unavailable", "storage unavailable")
+			return
+		}
+		pods, nodes := response.Responses[0].GetResponseRange().Kvs, response.Responses[1].GetResponseRange().Kvs
+		if len(pods) == 0 || len(nodes) == 0 {
+			respondError(404, "NotFound", "pod or node not found")
+			return
+		}
+		po, err := decode(pods[0].Value, "pods", pods[0].ModRevision)
+		if err != nil {
+			respondError(503, "Unavailable", "invalid stored pod")
+			return
+		}
+		no, err := decode(nodes[0].Value, "nodes", nodes[0].ModRevision)
+		if err != nil {
+			respondError(503, "Unavailable", "invalid stored node")
+			return
+		}
+		p, n := po.value.(*api.Pod), no.value.(*api.Node)
+		setAuditUID(ctx, p.Metadata.UID)
+		if p.Metadata.UID != req.PodUID || n.Metadata.UID != req.NodeUID || p.Metadata.DeletionTimestamp != nil {
+			respondError(409, "Conflict", "UID mismatch or deleting pod")
+			return
+		}
+		// 相同目标的重复绑定返回现有结果，不再增加预留。
+		if p.NodeUID == n.Metadata.UID {
+			writeJSON(w, p)
+			return
+		}
+		if p.NodeUID != "" || p.Metadata.ResourceVersion != req.ResourceVersion || !n.Status.Ready || n.Spec.Unschedulable {
+			respondError(409, "Conflict", "pod or node cannot be bound")
+			return
+		}
+		request := p.Spec.Resources.Requests
+		reserved, capacity := n.Status.Reserved, n.Spec.Allocatable
+		if request.CPUMilli > capacity.CPUMilli-reserved.CPUMilli || request.MemoryBytes > capacity.MemoryBytes-reserved.MemoryBytes {
+			respondError(409, "Conflict", "insufficient resources")
+			return
+		}
+		n.Status.Reserved.CPUMilli += request.CPUMilli
+		n.Status.Reserved.MemoryBytes += request.MemoryBytes
+		p.NodeUID = n.Metadata.UID
+		// 同时比较 Pod 和 Node 版本，并原子写入绑定与预留；冲突后重新读取。
+		tx, err := s.Client.Txn(ctx).
+			If(clientv3.Compare(clientv3.ModRevision(resourceKey("pods", name)), "=", pods[0].ModRevision),
+				clientv3.Compare(clientv3.ModRevision(resourceKey("nodes", req.NodeName)), "=", nodes[0].ModRevision)).
+			Then(clientv3.OpPut(resourceKey("pods", name), encodeObject(po)),
+				clientv3.OpPut(resourceKey("nodes", req.NodeName), encodeObject(no))).
+			Commit()
+		if err != nil {
+			respondError(503, "Unavailable", "storage unavailable")
+			return
+		}
+		if tx.Succeeded {
+			p.Metadata.ResourceVersion = tx.Header.Revision
+			writeJSON(w, p)
+			return
+		}
+	}
+	respondError(409, "Conflict", "concurrent binding conflict")
+}
+
+func (s *Server) status(w http.ResponseWriter, r *http.Request, kind, name string, who identity, respondError errorResponder) {
+	if kind != "pods" && kind != "nodes" {
+		respondError(403, "Forbidden", "unsupported status")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	get, err := s.Client.Get(ctx, resourceKey(kind, name))
+	if err != nil {
+		respondError(503, "Unavailable", "storage unavailable")
+		return
+	}
+	if len(get.Kvs) == 0 {
+		respondError(404, "NotFound", "resource not found")
+		return
+	}
+	old, err := decode(get.Kvs[0].Value, kind, get.Kvs[0].ModRevision)
+	if err != nil || !s.agentCanRead(ctx, who, kind, old) {
+		respondError(403, "Forbidden", "resource not authorized")
+		return
+	}
+	setAuditUID(ctx, old.meta.UID)
+	var req struct {
+		ResourceVersion int64           `json:"resourceVersion"`
+		Status          json.RawMessage `json:"status"`
+	}
+	if err := api.DecodeStrict(io.LimitReader(r.Body, 1<<20), &req); err != nil {
+		respondError(400, "Invalid", err.Error())
+		return
+	}
+	if req.ResourceVersion != old.meta.ResourceVersion {
+		respondError(409, "Conflict", "resourceVersion conflict")
+		return
+	}
+	switch v := old.value.(type) {
+	case *api.Pod:
+		var st api.PodStatus
+		if err := api.DecodeStrict(strings.NewReader(string(req.Status)), &st); err != nil {
+			respondError(400, "Invalid", err.Error())
+			return
+		}
+		switch st.Phase {
+		case "Pending", "Running", "Succeeded", "Failed", "Unknown":
+		default:
+			respondError(400, "Invalid", "unknown Pod phase")
+			return
+		}
+		if st.RestartCount < v.Status.RestartCount || (st.Ready && st.Phase != "Running") {
+			respondError(400, "Invalid", "invalid readiness or restart count")
+			return
+		}
+		if (v.Status.Phase == "Succeeded" || v.Status.Phase == "Failed") && st.Phase != v.Status.Phase {
+			respondError(409, "Conflict", "terminal Pod cannot change phase")
+			return
+		}
+		v.Status = st
+	case *api.Node:
+		var st api.NodeStatus
+		if err := api.DecodeStrict(strings.NewReader(string(req.Status)), &st); err != nil {
+			respondError(400, "Invalid", err.Error())
+			return
+		}
+		// 资源预留由绑定和清理事务维护，Agent 的状态上报不得修改。
+		if st.Reserved != v.Status.Reserved {
+			respondError(403, "Forbidden", "reservation is a system field")
+			return
+		}
+		v.Status = st
+	}
+	res, err := s.Client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(resourceKey(kind, name)), "=", req.ResourceVersion)).Then(clientv3.OpPut(resourceKey(kind, name), encodeObject(old))).Commit()
+	if err != nil {
+		respondError(503, "Unavailable", "storage unavailable")
+		return
+	}
+	if !res.Succeeded {
+		respondError(409, "Conflict", "resourceVersion conflict")
+		return
+	}
+	old.meta.ResourceVersion = res.Header.Revision
+	writeJSON(w, old.value)
+}
+
+// cleanup 接收节点对本地实例已停止并清理的确认。
+// Pod 删除与预留释放必须在同一事务中完成。
+func (s *Server) cleanup(w http.ResponseWriter, r *http.Request, name string, who identity, respondError errorResponder) {
+	var req struct {
+		UID             string `json:"uid"`
+		ResourceVersion int64  `json:"resourceVersion"`
+	}
+	if err := api.DecodeStrict(io.LimitReader(r.Body, 1<<20), &req); err != nil || req.UID == "" || req.ResourceVersion <= 0 {
+		respondError(400, "Invalid", "uid and resourceVersion required")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	for attempt := 0; attempt < 5; attempt++ {
+		res, err := s.Client.Txn(ctx).Then(clientv3.OpGet(resourceKey("pods", name)), clientv3.OpGet(resourceKey("nodes", who.node))).Commit()
+		if err != nil {
+			respondError(503, "Unavailable", "storage unavailable")
+			return
+		}
+		pods, nodes := res.Responses[0].GetResponseRange().Kvs, res.Responses[1].GetResponseRange().Kvs
+		if len(pods) == 0 {
+			writeJSON(w, map[string]string{"result": "already absent"})
+			return
+		}
+		if len(nodes) == 0 {
+			respondError(403, "Forbidden", "node not registered")
+			return
+		}
+		po, err := decode(pods[0].Value, "pods", pods[0].ModRevision)
+		if err != nil {
+			respondError(503, "Unavailable", "invalid stored pod")
+			return
+		}
+		no, err := decode(nodes[0].Value, "nodes", nodes[0].ModRevision)
+		if err != nil {
+			respondError(503, "Unavailable", "invalid stored node")
+			return
+		}
+		p, n := po.value.(*api.Pod), no.value.(*api.Node)
+		setAuditUID(ctx, p.Metadata.UID)
+		if p.Metadata.UID != req.UID || p.Metadata.ResourceVersion != req.ResourceVersion || p.Metadata.DeletionTimestamp == nil || p.NodeUID != n.Metadata.UID {
+			respondError(409, "Conflict", "pod identity, deletion or binding mismatch")
+			return
+		}
+		requests := p.Spec.Resources.Requests
+		if n.Status.Reserved.CPUMilli < requests.CPUMilli || n.Status.Reserved.MemoryBytes < requests.MemoryBytes {
+			respondError(409, "Conflict", "invalid reservation")
+			return
+		}
+		n.Status.Reserved.CPUMilli -= requests.CPUMilli
+		n.Status.Reserved.MemoryBytes -= requests.MemoryBytes
+		result, err := s.Client.Txn(ctx).
+			If(clientv3.Compare(clientv3.ModRevision(resourceKey("pods", name)), "=", pods[0].ModRevision),
+				clientv3.Compare(clientv3.ModRevision(resourceKey("nodes", who.node)), "=", nodes[0].ModRevision)).
+			Then(clientv3.OpDelete(resourceKey("pods", name)),
+				clientv3.OpPut(resourceKey("nodes", who.node), encodeObject(no))).
+			Commit()
+		if err != nil {
+			respondError(503, "Unavailable", "storage unavailable")
+			return
+		}
+		if result.Succeeded {
+			writeJSON(w, map[string]string{"result": "cleaned"})
+			return
+		}
+	}
+	respondError(409, "Conflict", "concurrent cleanup conflict")
+}
