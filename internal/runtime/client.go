@@ -48,13 +48,71 @@ type Observation struct {
 
 // Client 是本节点唯一的 CRI 执行者。调用方必须在退出时调用 Close。
 type Client struct {
-	conn     *grpc.ClientConn
-	runtime  runtimev1.RuntimeServiceClient
-	images   runtimev1.ImageServiceClient
-	stateDir string
-	logDir   string
-	lock     *os.File
-	mu       sync.Mutex
+	conn      *grpc.ClientConn
+	runtime   runtimev1.RuntimeServiceClient
+	images    runtimev1.ImageServiceClient
+	stateDir  string
+	logDir    string
+	lock      *os.File
+	mu        sync.Mutex
+	active    sync.WaitGroup
+	closeDone chan struct{}
+	closeErr  error
+	podMu     sync.Mutex
+	podGates  map[string]*podGate
+	closed    bool
+}
+
+type podGate struct {
+	lock  chan struct{}
+	users int
+}
+
+// lockPod 使相同 UID 的生命周期操作串行，不同 UID 可并发；关闭客户端会等待已开始的操作。
+func (c *Client) lockPod(ctx context.Context, uid string) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil, errors.New("runtime client is closed")
+	}
+	// 关闭在持有同一锁时禁止新登记，因此 Wait 与 Add 不会竞争。
+	c.active.Add(1)
+	c.mu.Unlock()
+	c.podMu.Lock()
+	if c.podGates == nil {
+		c.podGates = make(map[string]*podGate)
+	}
+	gate := c.podGates[uid]
+	if gate == nil {
+		gate = &podGate{lock: make(chan struct{}, 1)}
+		c.podGates[uid] = gate
+	}
+	gate.users++
+	c.podMu.Unlock()
+	releaseReference := func() {
+		c.podMu.Lock()
+		gate.users--
+		if gate.users == 0 {
+			delete(c.podGates, uid)
+		}
+		c.podMu.Unlock()
+		c.active.Done()
+	}
+	select {
+	case gate.lock <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-gate.lock
+			releaseReference()
+			return nil, err
+		}
+		return func() { <-gate.lock; releaseReference() }, nil
+	case <-ctx.Done():
+		releaseReference()
+		return nil, ctx.Err()
+	}
 }
 
 // New 连接本机 Unix socket 并取得 stateDir 的非阻塞进程锁。
@@ -91,7 +149,21 @@ func New(endpoint, stateDir, logDir string) (*Client, error) {
 // Close 关闭 CRI 连接并释放节点互斥锁。
 func (c *Client) Close() error {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	if c.closeDone != nil {
+		done := c.closeDone
+		c.mu.Unlock()
+		<-done
+		c.mu.Lock()
+		err := c.closeErr
+		c.mu.Unlock()
+		return err
+	}
+	c.closed = true
+	c.closeDone = make(chan struct{})
+	done := c.closeDone
+	c.mu.Unlock()
+	// 不持有生命周期锁等待在途请求；新调用可立即观察到 closed。
+	c.active.Wait()
 	var connErr, lockErr error
 	if c.conn != nil {
 		connErr = c.conn.Close()
@@ -101,7 +173,12 @@ func (c *Client) Close() error {
 		lockErr = releaseLock(c.lock)
 		c.lock = nil
 	}
-	return errors.Join(connErr, lockErr)
+	err := errors.Join(connErr, lockErr)
+	c.mu.Lock()
+	c.closeErr = err
+	close(done)
+	c.mu.Unlock()
+	return err
 }
 
 func labels(uid string) map[string]string {
@@ -110,6 +187,9 @@ func labels(uid string) map[string]string {
 
 func logOperation(uid, action string, err error) {
 	slog.Info("CRI operation", "podUID", uid, "action", action, "success", err == nil)
+}
+func logTimedOperation(uid, action string, started time.Time, err error) {
+	slog.Info("CRI operation", "podUID", uid, "action", action, "success", err == nil, "durationMs", time.Since(started).Milliseconds())
 }
 func matches(values map[string]string, uid string) bool {
 	return values[managedLabel] == "true" && values[podUIDLabel] == uid

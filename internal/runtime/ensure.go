@@ -62,9 +62,12 @@ func (c *Client) Ensure(ctx context.Context, pod api.Pod) (Observation, error) {
 	if _, err := containerConfig(pod, 0); err != nil {
 		return Observation{}, err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	uid := pod.Metadata.UID
+	unlock, err := c.lockPod(ctx, uid)
+	if err != nil {
+		return Observation{}, err
+	}
+	defer unlock()
 	state, err := c.snapshot(ctx, uid)
 	if err != nil {
 		return Observation{}, err

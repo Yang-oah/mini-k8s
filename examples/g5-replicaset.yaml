@@ -1,0 +1,25 @@
+apiVersion: mini.k8s/v1
+kind: ReplicaSet
+metadata:
+  name: g5-demo
+  namespace: default
+spec:
+  replicas: 20
+  selector:
+    app: g5-demo
+  template:
+    labels:
+      app: g5-demo
+    spec:
+      # 请替换为两台 Worker 均已预拉取、默认即监听 8080 的真实镜像 digest。
+      image: example.invalid/g5-app@sha256:0000000000000000000000000000000000000000000000000000000000000000
+      restartPolicy: Always
+      resources:
+        requests:
+          cpuMilli: 50
+          memoryBytes: 67108864
+        limits:
+          cpuMilli: 100
+          memoryBytes: 134217728
+      readiness:
+        port: 8080

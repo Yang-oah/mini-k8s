@@ -21,7 +21,11 @@ func main() {
 	cert := flag.String("tls-cert", "", "server certificate PEM")
 	key := flag.String("tls-key", "", "server private key PEM")
 	auth := flag.String("auth-file", "", "JSON identity credentials file")
+	serviceCIDR := flag.String("service-cidr", "", "IPv4 CIDR for Service addresses (must not overlap Pod or host networks)")
 	flag.Parse()
+	if err := server.ValidateServiceCIDR(*serviceCIDR); err != nil {
+		log.Fatalf("invalid service-cidr: %v", err)
+	}
 	if *cert == "" || *key == "" || *auth == "" {
 		log.Fatal("tls-cert, tls-key, and auth-file are required")
 	}
@@ -44,7 +48,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer client.Close()
-	apiServer := &server.Server{Client: client, Credentials: credentials}
+	apiServer := &server.Server{Client: client, Credentials: credentials, ServiceCIDR: *serviceCIDR}
 	monitorCtx, cancelMonitor := context.WithCancel(context.Background())
 	defer cancelMonitor()
 	go apiServer.RunNodeHealthMonitor(monitorCtx)

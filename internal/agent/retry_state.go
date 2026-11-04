@@ -18,6 +18,12 @@ type retryRecord struct {
 	InFlight    bool      `json:"inFlight"`
 }
 
+func (a *Agent) retryFor(uid string) retryState {
+	a.retryMu.Lock()
+	defer a.retryMu.Unlock()
+	return a.retries[uid]
+}
+
 // loadRetries 拒绝损坏的状态，避免静默重置仍需执行的退避。
 func (a *Agent) loadRetries() error {
 	file, err := os.Open(a.statePath)
@@ -55,8 +61,10 @@ func (a *Agent) loadRetries() error {
 	return nil
 }
 
-// saveRetry 先原子持久化再发布内存状态；调用方串行对账，节点锁由 runtime 持有。
+// saveRetry 先原子持久化再发布内存状态；不同 UID 的并发清理共用此文件。
 func (a *Agent) saveRetry(uid string, state retryState) error {
+	a.retryMu.Lock()
+	defer a.retryMu.Unlock()
 	records := make(map[string]retryRecord, len(a.retries)+1)
 	for key, value := range a.retries {
 		if key != uid {

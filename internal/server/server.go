@@ -27,6 +27,7 @@ type Credentials struct {
 	Admin      string            `json:"admin"`
 	Controller string            `json:"controller"`
 	Scheduler  string            `json:"scheduler"`
+	Proxy      string            `json:"proxy,omitempty"`
 	Agents     map[string]string `json:"agents"`
 }
 
@@ -35,6 +36,8 @@ type Server struct {
 	Client      *clientv3.Client
 	Credentials Credentials
 	Log         *slog.Logger
+	// ServiceCIDR 必须显式配置；创建 Service 时持久化并固定该地址池。
+	ServiceCIDR string
 }
 
 type identity struct{ role, node string }
@@ -65,6 +68,9 @@ func (s *Server) authenticate(header string) identity {
 	}
 	if match(s.Credentials.Scheduler) {
 		return identity{role: "scheduler"}
+	}
+	if match(s.Credentials.Proxy) {
+		return identity{role: "proxy"}
 	}
 	for node, expected := range s.Credentials.Agents {
 		if match(expected) {
@@ -151,12 +157,35 @@ func validateObject(o object) error {
 }
 func resourceKey(kind, name string) string { return prefix + kind + "/" + name }
 
+// 客户端最多等待 5 秒；为存储超时后的 503 编码和网络返回保留余量。
+// 普通读写请求共享同一个期限，避免写入前的读取或多次事务重新计时。
+// Watch 是长连接，不适用这个期限。
+const requestTimeout = 4 * time.Second
+
+// 只有资源集合的 Watch 才是长连接；普通接口不能借查询参数绕过期限。
+func isWatchRequest(r *http.Request) bool {
+	if r.Method != http.MethodGet || r.URL.Query().Get("watch") != "true" {
+		return false
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/api/mini/v1/")
+	if path == r.URL.Path {
+		return false
+	}
+	_, ok := newObject(strings.Trim(path, "/"))
+	return ok
+}
+
 // ServeHTTP 认证请求并按身份及资源类型分派操作。
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	id := newUID()
 	audit := &auditContext{}
 	r = r.WithContext(context.WithValue(r.Context(), auditKey{}, audit))
+	if !isWatchRequest(r) {
+		ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+		defer cancel()
+		r = r.WithContext(ctx)
+	}
 	who := s.authenticate(r.Header.Get("Authorization"))
 	status := http.StatusOK
 	logger := s.Log
@@ -174,6 +203,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/api/mini/v1/")
 	if path == r.URL.Path {
 		respondError(404, "NotFound", "unknown path")
+		return
+	}
+	if strings.Trim(path, "/") == "service-pool" {
+		if who.role != "admin" || r.Method != http.MethodGet {
+			respondError(403, "Forbidden", "service pool inspection requires administrator read access")
+			return
+		}
+		s.servicePoolStatus(w, r, respondError)
 		return
 	}
 	parts := strings.Split(strings.Trim(path, "/"), "/")
@@ -202,6 +239,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 状态、绑定和清理走独立入口，用户资源写入不能绕过对应身份检查。
 	if who.role == "agent" && ((r.Method != "GET" && action != "status" && action != "cleanup") || (kind != "pods" && kind != "nodes")) {
 		respondError(403, "Forbidden", "agent not authorized")
+		return
+	}
+	// Proxy 只读取端点计算所需资源，不能修改集群或访问其他资源。
+	if who.role == "proxy" && (r.Method != http.MethodGet || action != "" || (kind != "services" && kind != "pods" && kind != "nodes")) {
+		respondError(403, "Forbidden", "proxy has read-only access to services, pods and nodes")
 		return
 	}
 	if action == "bind" {
@@ -286,8 +328,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				respondError(503, "Unavailable", "stored resource invalid")
 				return
 			}
-			if who.role == "agent" && !s.agentCanRead(ctx, who, kind, o) {
-				continue
+			if who.role == "agent" {
+				allowed, err := s.agentCanRead(ctx, who, kind, o)
+				if err != nil {
+					respondError(503, "Unavailable", "storage unavailable")
+					return
+				}
+				if !allowed {
+					continue
+				}
 			}
 			if node, ok := o.value.(*api.Node); ok {
 				if who.role == "scheduler" {
@@ -343,22 +392,25 @@ func selectorsOverlap(a, b map[string]string) bool {
 	}
 	return true
 }
-func (s *Server) agentCanRead(ctx context.Context, who identity, kind string, o object) bool {
+func (s *Server) agentCanRead(ctx context.Context, who identity, kind string, o object) (bool, error) {
 	if kind == "nodes" {
-		return o.meta.Name == who.node
+		return o.meta.Name == who.node, nil
 	}
 	if kind != "pods" {
-		return false
+		return false, nil
 	}
 	n, err := s.Client.Get(ctx, resourceKey("nodes", who.node))
-	if err != nil || len(n.Kvs) != 1 {
-		return false
+	if err != nil {
+		return false, err
+	}
+	if len(n.Kvs) != 1 {
+		return false, nil
 	}
 	obj, err := decode(n.Kvs[0].Value, "nodes", n.Kvs[0].ModRevision)
 	if err != nil {
-		return false
+		return false, err
 	}
-	return o.value.(*api.Pod).NodeUID != "" && o.value.(*api.Pod).NodeUID == obj.meta.UID
+	return o.value.(*api.Pod).NodeUID != "" && o.value.(*api.Pod).NodeUID == obj.meta.UID, nil
 }
 
 // ValidateCredentials 检查必需凭据，并禁止不同身份共用令牌。
@@ -377,7 +429,7 @@ func ValidateCredentials(c Credentials) error {
 	if c.Admin == "" || c.Scheduler == "" {
 		return errors.New("admin and scheduler credentials required")
 	}
-	for _, v := range []string{c.Admin, c.Scheduler, c.Controller} {
+	for _, v := range []string{c.Admin, c.Scheduler, c.Controller, c.Proxy} {
 		if err := check(v); err != nil {
 			return err
 		}

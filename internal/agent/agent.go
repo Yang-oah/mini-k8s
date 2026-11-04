@@ -42,7 +42,7 @@ type retryState struct {
 	inFlight    bool
 }
 
-// Agent 以预注册节点的身份观察分配，并串行处理本地 Pod。
+// Agent 以预注册节点的身份观察分配，并对删除中的 Pod 执行有界并发清理。
 type Agent struct {
 	base           string
 	token          string
@@ -54,6 +54,9 @@ type Agent struct {
 	statePath      string
 	runtimeTimeout time.Duration
 	runtimeGate    chan struct{}
+	podMu          sync.Mutex
+	podGates       map[string]*podGate
+	retryMu        sync.Mutex
 	nodeMu         sync.Mutex
 	nodeUID        string
 	readinessMu    sync.Mutex
@@ -65,6 +68,11 @@ type Agent struct {
 type apiError struct {
 	status       int
 	method, path string
+}
+
+type podGate struct {
+	lock  chan struct{}
+	users int
 }
 
 func (e *apiError) Error() string {
@@ -104,7 +112,7 @@ func New(server, node, tokenFile, caFile string, resync time.Duration, runtime R
 		base: strings.TrimSuffix(server, "/"), token: strings.TrimSpace(string(token)), node: node,
 		client:  &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}}},
 		runtime: runtime, resync: resync, retries: make(map[string]retryState),
-		statePath: filepath.Join(stateDir, "retry-state.json"), runtimeTimeout: 30 * time.Second, runtimeGate: make(chan struct{}, 1),
+		statePath: filepath.Join(stateDir, "retry-state.json"), runtimeTimeout: 30 * time.Second, runtimeGate: make(chan struct{}, 8),
 		readiness: make(map[string]*readinessState), readinessWake: make(chan struct{}, 1),
 	}
 	if err := a.loadRetries(); err != nil {
@@ -125,10 +133,35 @@ func (a *Agent) runtimeLimit() time.Duration {
 	return timeout
 }
 
-// 控制 socket 与对账共用运行时；等待本地互斥也必须受同一 deadline 约束。
-func (a *Agent) withRuntime(ctx context.Context, operation func(context.Context) error) error {
+// 控制 socket 与对账共享 UID 互斥和总并发上限，等待也受同一 deadline 约束。
+func (a *Agent) withRuntime(ctx context.Context, uid string, operation func(context.Context) error) error {
 	callCtx, cancel := a.runtimeContext(ctx)
 	defer cancel()
+	a.podMu.Lock()
+	if a.podGates == nil {
+		a.podGates = make(map[string]*podGate)
+	}
+	gate := a.podGates[uid]
+	if gate == nil {
+		gate = &podGate{lock: make(chan struct{}, 1)}
+		a.podGates[uid] = gate
+	}
+	gate.users++
+	a.podMu.Unlock()
+	defer func() {
+		a.podMu.Lock()
+		gate.users--
+		if gate.users == 0 {
+			delete(a.podGates, uid)
+		}
+		a.podMu.Unlock()
+	}()
+	select {
+	case gate.lock <- struct{}{}:
+		defer func() { <-gate.lock }()
+	case <-callCtx.Done():
+		return callCtx.Err()
+	}
 	select {
 	case a.runtimeGate <- struct{}{}:
 		defer func() { <-a.runtimeGate }()
@@ -266,16 +299,49 @@ func (a *Agent) reconcileAll(ctx context.Context) error {
 		return err
 	}
 	assigned := make(map[string]bool)
+	var deleting, active []api.Pod
 	for _, pod := range list.Items {
 		if pod.NodeUID != node.Metadata.UID || pod.Metadata.UID == "" {
 			continue
 		}
 		assigned[pod.Metadata.UID] = true
+		if pod.Metadata.DeletionTimestamp != nil {
+			deleting = append(deleting, pod)
+		} else {
+			active = append(active, pod)
+		}
+	}
+	// 删除操作可能等待容器退出和 CNI；限制并发，避免一个 Pod 阻塞整个节点的缩容。
+	const maxConcurrentCleanup = 6
+	queue := make(chan api.Pod, len(deleting))
+	for _, pod := range deleting {
+		queue <- pod
+	}
+	close(queue)
+	var cleanups sync.WaitGroup
+	workers := min(maxConcurrentCleanup, len(deleting))
+	for i := 0; i < workers; i++ {
+		cleanups.Add(1)
+		go func() {
+			defer cleanups.Done()
+			for pod := range queue {
+				if ctx.Err() != nil {
+					return
+				}
+				if err := a.reconcilePod(ctx, node.Metadata.UID, pod); err != nil && ctx.Err() == nil {
+					log.Printf("agent pod uid=%s cleanup failed", pod.Metadata.UID)
+				}
+			}
+		}()
+	}
+	// 清理上限小于运行时总并发，为正常 Pod 和控制请求保留容量。
+	for _, pod := range active {
 		if err := a.reconcilePod(ctx, node.Metadata.UID, pod); err != nil && ctx.Err() == nil {
 			// 不记录 runtime 返回内容，避免镜像参数或环境变量进入日志。
 			log.Printf("agent pod uid=%s reconciliation failed", pod.Metadata.UID)
 		}
 	}
+	cleanups.Wait()
 	a.pruneReadiness(assigned)
 	return nil
 }
@@ -290,7 +356,7 @@ func (a *Agent) reconcilePod(ctx context.Context, nodeUID string, pod api.Pod) e
 		return nil
 	}
 	var observation containerruntime.Observation
-	err := a.withRuntime(ctx, func(callCtx context.Context) error {
+	err := a.withRuntime(ctx, pod.Metadata.UID, func(callCtx context.Context) error {
 		var inspectErr error
 		observation, inspectErr = a.runtime.Inspect(callCtx, pod.Metadata.UID)
 		return inspectErr
@@ -305,7 +371,7 @@ func (a *Agent) reconcilePod(ctx context.Context, nodeUID string, pod api.Pod) e
 		observation.ExitReason = fmt.Sprintf("ExitCode %d", observation.ExitCode)
 	}
 	now := time.Now()
-	state := a.retries[pod.Metadata.UID]
+	state := a.retryFor(pod.Metadata.UID)
 	if observation.Running {
 		if state != (retryState{}) && !observation.StartedAt.IsZero() && now.Sub(observation.StartedAt) >= time.Minute {
 			state = retryState{}
@@ -368,7 +434,7 @@ func (a *Agent) reconcilePod(ctx context.Context, nodeUID string, pod api.Pod) e
 	if err := a.saveRetry(pod.Metadata.UID, state); err != nil {
 		return err
 	}
-	err = a.withRuntime(ctx, func(callCtx context.Context) error {
+	err = a.withRuntime(ctx, current.Metadata.UID, func(callCtx context.Context) error {
 		var ensureErr error
 		observation, ensureErr = a.runtime.Ensure(callCtx, current)
 		return ensureErr
@@ -437,7 +503,7 @@ func (a *Agent) cleanupPod(ctx context.Context, nodeUID string, pod api.Pod) err
 	if current.Metadata.UID != pod.Metadata.UID || current.NodeUID != nodeUID || current.Metadata.DeletionTimestamp == nil {
 		return errors.New("pod identity or deletion state changed")
 	}
-	err := a.withRuntime(ctx, func(callCtx context.Context) error { return a.runtime.Cleanup(callCtx, current.Metadata.UID) })
+	err := a.withRuntime(ctx, current.Metadata.UID, func(callCtx context.Context) error { return a.runtime.Cleanup(callCtx, current.Metadata.UID) })
 	if err != nil {
 		return err
 	}
@@ -454,7 +520,7 @@ func (a *Agent) Logs(ctx context.Context, uid string, tail int) (string, error) 
 		return "", errors.New("UID and nonnegative tail required")
 	}
 	var logs string
-	err := a.withRuntime(ctx, func(callCtx context.Context) error {
+	err := a.withRuntime(ctx, uid, func(callCtx context.Context) error {
 		var logsErr error
 		logs, logsErr = a.runtime.Logs(callCtx, uid, tail)
 		return logsErr
@@ -490,7 +556,7 @@ func (a *Agent) CleanupStale(ctx context.Context, name, uid string) error {
 		}
 	}
 	var observed containerruntime.Observation
-	err = a.withRuntime(ctx, func(callCtx context.Context) error {
+	err = a.withRuntime(ctx, uid, func(callCtx context.Context) error {
 		var inspectErr error
 		observed, inspectErr = a.runtime.Inspect(callCtx, uid)
 		return inspectErr
@@ -501,5 +567,5 @@ func (a *Agent) CleanupStale(ctx context.Context, name, uid string) error {
 	if observed.Exists && observed.PodName != name {
 		return errors.New("runtime Pod name does not match")
 	}
-	return a.withRuntime(ctx, func(callCtx context.Context) error { return a.runtime.Cleanup(callCtx, uid) })
+	return a.withRuntime(ctx, uid, func(callCtx context.Context) error { return a.runtime.Cleanup(callCtx, uid) })
 }

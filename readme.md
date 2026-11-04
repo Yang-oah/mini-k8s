@@ -11,6 +11,9 @@
 - [G2 副本控制器说明](docs/g2.md)
 - [G3 单节点 Agent 说明](docs/g3.md)
 - [G4 两节点调度与验收说明](docs/g4.md)
+- [G5 readiness 验收说明](docs/g5-readiness.md)
+- [G5 Service 验收说明](docs/g5-service.md)
+- [两节点运行与排障指南](docs/operations.md)（待最终版本验证）
 
 计划依次完成最小控制面（G1）、副本对账（G2）、单节点运行时（G3）、两节点调度（G4）和 Service 演示（G5）。每阶段必须通过对应 Gateway 才进入下一阶段；未运行或缺少真实环境的检查不能视为通过。
 
