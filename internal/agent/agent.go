@@ -56,6 +56,10 @@ type Agent struct {
 	runtimeGate    chan struct{}
 	nodeMu         sync.Mutex
 	nodeUID        string
+	readinessMu    sync.Mutex
+	readiness      map[string]*readinessState
+	readinessWake  chan struct{}
+	readinessEpoch uint64
 }
 
 type apiError struct {
@@ -101,6 +105,7 @@ func New(server, node, tokenFile, caFile string, resync time.Duration, runtime R
 		client:  &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}}},
 		runtime: runtime, resync: resync, retries: make(map[string]retryState),
 		statePath: filepath.Join(stateDir, "retry-state.json"), runtimeTimeout: 30 * time.Second, runtimeGate: make(chan struct{}, 1),
+		readiness: make(map[string]*readinessState), readinessWake: make(chan struct{}, 1),
 	}
 	if err := a.loadRetries(); err != nil {
 		return nil, err
@@ -155,10 +160,14 @@ func (a *Agent) call(ctx context.Context, method, path string, body, target any)
 	}
 	resp, err := a.client.Do(req)
 	if err != nil {
+		a.invalidateReadiness()
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode >= 500 {
+			a.invalidateReadiness()
+		}
 		return &apiError{status: resp.StatusCode, method: method, path: path}
 	}
 	if target != nil {
@@ -169,10 +178,15 @@ func (a *Agent) call(ctx context.Context, method, path string, body, target any)
 
 // Run 持续重新读取节点与分配快照；控制面不可用时不清理或新建本地实例。
 func (a *Agent) Run(ctx context.Context) error {
+	defer a.invalidateReadiness()
 	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
 	defer stopHeartbeat()
 	go a.runHeartbeats(heartbeatCtx)
-	ticker := time.NewTicker(a.resync)
+	interval := a.resync
+	if interval > readinessInterval {
+		interval = readinessInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		if err := a.reconcileAll(ctx); err != nil && ctx.Err() == nil {
@@ -182,6 +196,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+		case <-a.readinessWake:
 		}
 	}
 }
@@ -243,29 +258,35 @@ func (a *Agent) reconcileAll(ctx context.Context) error {
 	if err := a.checkNodeUID(node.Metadata.UID); err != nil {
 		return err
 	}
+	a.setReadinessEpoch(node.Status.Ready, node.Status.ReadinessEpoch)
 	var list struct {
 		Items []api.Pod `json:"items"`
 	}
 	if err := a.call(ctx, http.MethodGet, "pods", nil, &list); err != nil {
 		return err
 	}
+	assigned := make(map[string]bool)
 	for _, pod := range list.Items {
 		if pod.NodeUID != node.Metadata.UID || pod.Metadata.UID == "" {
 			continue
 		}
+		assigned[pod.Metadata.UID] = true
 		if err := a.reconcilePod(ctx, node.Metadata.UID, pod); err != nil && ctx.Err() == nil {
 			// 不记录 runtime 返回内容，避免镜像参数或环境变量进入日志。
 			log.Printf("agent pod uid=%s reconciliation failed", pod.Metadata.UID)
 		}
 	}
+	a.pruneReadiness(assigned)
 	return nil
 }
 
 func (a *Agent) reconcilePod(ctx context.Context, nodeUID string, pod api.Pod) error {
 	if pod.Metadata.DeletionTimestamp != nil {
+		a.forgetReadiness(pod.Metadata.UID)
 		return a.cleanupPod(ctx, nodeUID, pod)
 	}
 	if pod.Status.Phase == "Succeeded" || pod.Status.Phase == "Failed" {
+		a.forgetReadiness(pod.Metadata.UID)
 		return nil
 	}
 	var observation containerruntime.Observation
@@ -275,6 +296,9 @@ func (a *Agent) reconcilePod(ctx context.Context, nodeUID string, pod api.Pod) e
 		return inspectErr
 	})
 	if err != nil {
+		a.forgetReadiness(pod.Metadata.UID)
+		// CRI 状态不可确认时不得继续报告旧的就绪状态。
+		_ = a.clearReady(ctx, pod)
 		return err
 	}
 	if observation.Exited && observation.ExitReason == "" {
@@ -290,6 +314,21 @@ func (a *Agent) reconcilePod(ctx context.Context, nodeUID string, pod api.Pod) e
 			}
 		}
 		return a.reportStatus(ctx, pod, observation)
+	}
+	a.forgetReadiness(pod.Metadata.UID)
+	if pod.Status.Ready {
+		if err := a.clearReady(ctx, pod); err != nil {
+			return err
+		}
+		// 清除 Ready 会推进资源版本；后续状态更新必须使用新版本。
+		var current api.Pod
+		if err := a.call(ctx, http.MethodGet, "pods/"+url.PathEscape(pod.Metadata.Name), nil, &current); err != nil {
+			return err
+		}
+		if current.Metadata.UID != pod.Metadata.UID || current.NodeUID != nodeUID {
+			return errors.New("pod identity or assignment changed")
+		}
+		pod = current
 	}
 	if observation.Exited && observation.ContainerID != "" && state.containerID != observation.ContainerID {
 		if !observation.StartedAt.IsZero() && observation.FinishedAt.Sub(observation.StartedAt) >= time.Minute {
@@ -369,7 +408,7 @@ func backoff(failures int) time.Duration {
 
 func (a *Agent) reportStatus(ctx context.Context, pod api.Pod, observed containerruntime.Observation) error {
 	status := pod.Status
-	status.Ready = false // readiness 在 G5 实现；旧容器的 Ready 不可沿用。
+	status.Ready, status.ReadinessEpoch = a.observedReady(ctx, pod, observed)
 	status.PodIP = observed.PodIP
 	if observed.Running {
 		status.Phase = "Running"

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"mini-k8s/internal/api"
@@ -14,6 +15,15 @@ const nodeHeartbeatTimeout = 18 * time.Second
 
 // bind 的整个存储事务最多允许 5 秒，留足余量避免提交时心跳已经过期。
 const nodeBindingHeartbeatLimit = nodeHeartbeatTimeout - 5*time.Second
+
+// advanceReadinessEpoch 在代次耗尽时保守拒绝恢复，避免旧证明因溢出重新有效。
+func advanceReadinessEpoch(n *api.Node) bool {
+	if n.Status.ReadinessEpoch == math.MaxUint64 {
+		return false
+	}
+	n.Status.ReadinessEpoch++
+	return true
+}
 
 func nodeHeartbeatFresh(n *api.Node, now time.Time) bool {
 	return !n.Status.LastHeartbeat.IsZero() && !n.Status.LastHeartbeat.After(now) && now.Sub(n.Status.LastHeartbeat) < nodeHeartbeatTimeout
@@ -75,6 +85,8 @@ func (s *Server) expireNodeHeartbeats(parent context.Context) {
 		}
 		n.Status.Ready = false
 		n.Status.Condition = "Unknown"
+		// 即使代次耗尽也要将节点标为 Unknown；后续心跳不能恢复其就绪状态。
+		advanceReadinessEpoch(n)
 		_, _ = s.Client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(string(kv.Key)), "=", kv.ModRevision)).Then(clientv3.OpPut(string(kv.Key), encodeObject(o))).Commit()
 	}
 }
