@@ -212,6 +212,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.bind(w, r, name, respondError)
 		return
 	}
+	if action == "scheduling" {
+		if who.role != "scheduler" || r.Method != "PUT" || kind != "pods" || name == "" {
+			respondError(403, "Forbidden", "scheduling status requires scheduler identity")
+			return
+		}
+		s.schedulingStatus(w, r, name, respondError)
+		return
+	}
 	if action == "status" {
 		if who.role != "agent" || r.Method != "PUT" {
 			respondError(403, "Forbidden", "status requires agent identity")
@@ -280,6 +288,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			if who.role == "agent" && !s.agentCanRead(ctx, who, kind, o) {
 				continue
+			}
+			if node, ok := o.value.(*api.Node); ok {
+				if who.role == "scheduler" {
+					projectNodeSchedulingHealth(node, time.Now())
+				} else {
+					projectNodeHealth(node, time.Now())
+				}
 			}
 			items = append(items, o.value)
 		}

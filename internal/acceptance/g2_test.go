@@ -433,11 +433,12 @@ func TestG2(t *testing.T) {
 	// G2-06：Unknown 且尚未确认清理的绑定 Pod 始终计入防重复额度。
 	run("G2-06_unconfirmed_stop", func(t *testing.T) {
 		f.call("POST", "nodes", admin, object{"apiVersion": "mini.k8s/v1", "kind": "Node", "metadata": object{"name": g.node}, "spec": object{"allocatable": object{"cpuMilli": 1000, "memoryBytes": 100000}, "podCIDR": "10.9.0.0/24"}}, 201)
-		node := f.call("GET", "nodes/"+g.node, admin, nil, 200)
-		f.call("PUT", "nodes/"+g.node+"/status", agent+"-g2", object{"resourceVersion": resourceVersionOf(node), "status": object{"ready": true, "reserved": object{"cpuMilli": 0, "memoryBytes": 0}}}, 200)
 		name, uid := g.createSet("unknown", 1)
 		pod := g.waitCount(uid, 1, 10*time.Second)[0]
 		podName := metadataOf(pod)["name"].(string)
+		// 模拟 Agent 在绑定前上报心跳，等待 Pod 创建的时间不消耗节点有效期。
+		node := f.call("GET", "nodes/"+g.node, admin, nil, 200)
+		f.call("PUT", "nodes/"+g.node+"/status", agent+"-g2", object{"resourceVersion": resourceVersionOf(node), "status": object{"ready": true, "reserved": object{"cpuMilli": 0, "memoryBytes": 0}}}, 200)
 		f.call("POST", "pods/"+podName+"/bind", scheduler, object{"nodeName": g.node, "nodeUID": uidOf(node), "podUID": uidOf(pod), "resourceVersion": resourceVersionOf(pod)}, 200)
 		for _, phase := range []string{"Running", "Unknown"} {
 			pod = f.call("GET", "pods/"+podName, admin, nil, 200)

@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"time"
 
 	"mini-k8s/internal/api"
@@ -53,6 +54,8 @@ type Agent struct {
 	statePath      string
 	runtimeTimeout time.Duration
 	runtimeGate    chan struct{}
+	nodeMu         sync.Mutex
+	nodeUID        string
 }
 
 type apiError struct {
@@ -166,6 +169,9 @@ func (a *Agent) call(ctx context.Context, method, path string, body, target any)
 
 // Run 持续重新读取节点与分配快照；控制面不可用时不清理或新建本地实例。
 func (a *Agent) Run(ctx context.Context) error {
+	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
+	defer stopHeartbeat()
+	go a.runHeartbeats(heartbeatCtx)
 	ticker := time.NewTicker(a.resync)
 	defer ticker.Stop()
 	for {
@@ -180,13 +186,62 @@ func (a *Agent) Run(ctx context.Context) error {
 	}
 }
 
+// 心跳与容器对账独立运行，单个运行时请求不能阻塞健康上报。
+func (a *Agent) runHeartbeats(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		if err := a.heartbeat(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("agent heartbeat: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+// 每次读取最新版本和预留，避免心跳覆盖并发的绑定或清理事务。
+func (a *Agent) heartbeat(ctx context.Context) error {
+	var node api.Node
+	path := "nodes/" + url.PathEscape(a.node)
+	if err := a.call(ctx, http.MethodGet, path, nil, &node); err != nil {
+		return err
+	}
+	if err := a.checkNodeUID(node.Metadata.UID); err != nil {
+		return err
+	}
+	node.Status.Ready = true
+	return a.call(ctx, http.MethodPut, path+"/status", struct {
+		ResourceVersion int64          `json:"resourceVersion"`
+		Status          api.NodeStatus `json:"status"`
+	}{node.Metadata.ResourceVersion, node.Status}, nil)
+}
+
+// 相同名称的节点被重新创建后，旧 Agent 不得继续对其分配或心跳操作。
+func (a *Agent) checkNodeUID(uid string) error {
+	if uid == "" {
+		return errors.New("registered node has no UID")
+	}
+	a.nodeMu.Lock()
+	defer a.nodeMu.Unlock()
+	if a.nodeUID == "" {
+		a.nodeUID = uid
+	}
+	if a.nodeUID != uid {
+		return errors.New("registered node UID changed; restart agent after verifying identity")
+	}
+	return nil
+}
+
 func (a *Agent) reconcileAll(ctx context.Context) error {
 	var node api.Node
 	if err := a.call(ctx, http.MethodGet, "nodes/"+url.PathEscape(a.node), nil, &node); err != nil {
 		return err
 	}
-	if node.Metadata.UID == "" {
-		return errors.New("registered node has no UID")
+	if err := a.checkNodeUID(node.Metadata.UID); err != nil {
+		return err
 	}
 	var list struct {
 		Items []api.Pod `json:"items"`

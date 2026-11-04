@@ -181,7 +181,9 @@ func (s *Server) update(ctx context.Context, w http.ResponseWriter, r *http.Requ
 			return
 		}
 	case *api.Node:
-		if !reflect.DeepEqual(v.Status, old.value.(*api.Node).Status) {
+		prior := old.value.(*api.Node)
+		projectNodeHealth(prior, time.Now())
+		if !reflect.DeepEqual(v.Status, prior.Status) {
 			respondError(403, "Forbidden", "status is a system field")
 			return
 		}

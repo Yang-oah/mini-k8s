@@ -654,7 +654,6 @@ func (g *g3Fixture) recordIdentities() {
 func (g *g3Fixture) createAndBind() {
 	g.t.Helper()
 	node := g.call("POST", "nodes", admin, object{"apiVersion": "mini.k8s/v1", "kind": "Node", "metadata": object{"name": g.nodeName}, "spec": object{"allocatable": object{"cpuMilli": 2000, "memoryBytes": 1073741824}, "podCIDR": g.podCIDRText}}, 201)
-	g.call("PUT", "nodes/"+g.nodeName+"/status", g3NodeToken, object{"resourceVersion": resourceVersionOf(node), "status": object{"ready": true, "reserved": object{"cpuMilli": 0, "memoryBytes": 0}}}, 200)
 	rs := replicaSetManifest(g.rsName)
 	rsspec := rs["spec"].(object)
 	template := rsspec["template"].(object)
@@ -673,6 +672,9 @@ func (g *g3Fixture) createAndBind() {
 	createdPod := g.call("POST", "pods", g3ControllerToken, pod, 201)
 	g.podUID = uidOf(createdPod)
 	g.recordIdentities()
+	// Agent 尚未启动，模拟心跳应紧邻绑定，避免准备工作耗尽节点有效期。
+	node = g.call("GET", "nodes/"+g.nodeName, admin, nil, 200)
+	g.call("PUT", "nodes/"+g.nodeName+"/status", g3NodeToken, object{"resourceVersion": resourceVersionOf(node), "status": object{"ready": true, "reserved": object{"cpuMilli": 0, "memoryBytes": 0}}}, 200)
 	g.call("POST", "pods/"+g.podName+"/bind", scheduler, object{"nodeName": g.nodeName, "nodeUID": uidOf(node), "podUID": g.podUID, "resourceVersion": resourceVersionOf(createdPod)}, 200)
 	g.boundAt = time.Now()
 }
