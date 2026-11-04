@@ -64,7 +64,7 @@ func (s *Server) bind(w http.ResponseWriter, r *http.Request, name string, respo
 			writeJSON(w, p)
 			return
 		}
-		if p.NodeUID != "" || p.Metadata.ResourceVersion != req.ResourceVersion || !n.Status.Ready || n.Spec.Unschedulable {
+		if p.NodeUID != "" || p.Metadata.ResourceVersion != req.ResourceVersion || !nodeAvailable(n, time.Now()) || n.Spec.Unschedulable {
 			respondError(409, "Conflict", "pod or node cannot be bound")
 			return
 		}
@@ -77,6 +77,7 @@ func (s *Server) bind(w http.ResponseWriter, r *http.Request, name string, respo
 		n.Status.Reserved.CPUMilli += request.CPUMilli
 		n.Status.Reserved.MemoryBytes += request.MemoryBytes
 		p.NodeUID = n.Metadata.UID
+		p.Status.Reason = ""
 		// 同时比较 Pod 和 Node 版本，并原子写入绑定与预留；冲突后重新读取。
 		tx, err := s.Client.Txn(ctx).
 			If(clientv3.Compare(clientv3.ModRevision(resourceKey("pods", name)), "=", pods[0].ModRevision),
@@ -95,6 +96,67 @@ func (s *Server) bind(w http.ResponseWriter, r *http.Request, name string, respo
 		}
 	}
 	respondError(409, "Conflict", "concurrent binding conflict")
+}
+
+// schedulingStatus 只允许调度器更新尚未绑定的 Pending Pod 的调度原因。
+func (s *Server) schedulingStatus(w http.ResponseWriter, r *http.Request, name string, respondError errorResponder) {
+	var req struct {
+		UID             string `json:"uid"`
+		ResourceVersion int64  `json:"resourceVersion"`
+		Reason          string `json:"reason"`
+	}
+	if err := api.DecodeStrict(io.LimitReader(r.Body, 1<<20), &req); err != nil {
+		respondError(400, "Invalid", err.Error())
+		return
+	}
+	switch req.Reason {
+	case "InsufficientCPU", "InsufficientMemory", "InsufficientCPUAndMemory", "NoReadyNodes":
+	default:
+		respondError(400, "Invalid", "invalid scheduling reason")
+		return
+	}
+	if req.UID == "" || req.ResourceVersion <= 0 {
+		respondError(400, "Invalid", "UID and resourceVersion required")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	key := resourceKey("pods", name)
+	get, err := s.Client.Get(ctx, key)
+	if err != nil {
+		respondError(503, "Unavailable", "storage unavailable")
+		return
+	}
+	if len(get.Kvs) == 0 {
+		respondError(404, "NotFound", "pod not found")
+		return
+	}
+	o, err := decode(get.Kvs[0].Value, "pods", get.Kvs[0].ModRevision)
+	if err != nil {
+		respondError(503, "Unavailable", "invalid stored pod")
+		return
+	}
+	p := o.value.(*api.Pod)
+	if p.Metadata.UID != req.UID || p.Metadata.ResourceVersion != req.ResourceVersion || p.NodeUID != "" || p.Metadata.DeletionTimestamp != nil || p.Status.Phase != "Pending" {
+		respondError(409, "Conflict", "pod is no longer eligible for scheduling status")
+		return
+	}
+	if p.Status.Reason == req.Reason {
+		writeJSON(w, p)
+		return
+	}
+	p.Status.Reason = req.Reason
+	tx, err := s.Client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(key), "=", req.ResourceVersion)).Then(clientv3.OpPut(key, encodeObject(o))).Commit()
+	if err != nil {
+		respondError(503, "Unavailable", "storage unavailable")
+		return
+	}
+	if !tx.Succeeded {
+		respondError(409, "Conflict", "resourceVersion conflict")
+		return
+	}
+	p.Metadata.ResourceVersion = tx.Header.Revision
+	writeJSON(w, p)
 }
 
 func (s *Server) status(w http.ResponseWriter, r *http.Request, kind, name string, who identity, respondError errorResponder) {
@@ -163,6 +225,13 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request, kind, name strin
 		if st.Reserved != v.Status.Reserved {
 			respondError(403, "Forbidden", "reservation is a system field")
 			return
+		}
+		// 只信任控制面的接收时间，客户端时钟不能延长租期。
+		st.LastHeartbeat = time.Now().UTC()
+		if st.Ready {
+			st.Condition = "Ready"
+		} else {
+			st.Condition = "NotReady"
 		}
 		v.Status = st
 	}

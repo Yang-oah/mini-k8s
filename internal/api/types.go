@@ -105,6 +105,7 @@ type NodeSpec struct {
 // NodeStatus 保存节点就绪状态、心跳和系统维护的已预留资源。
 type NodeStatus struct {
 	Ready         bool      `json:"ready"`
+	Condition     string    `json:"condition,omitempty"`
 	LastHeartbeat time.Time `json:"lastHeartbeat,omitempty"`
 	Reserved      Resources `json:"reserved"`
 }

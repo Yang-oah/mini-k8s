@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"log"
@@ -43,6 +44,10 @@ func main() {
 		log.Fatal(err)
 	}
 	defer client.Close()
-	httpServer := &http.Server{Addr: *listen, Handler: &server.Server{Client: client, Credentials: credentials}, ReadHeaderTimeout: 5 * time.Second}
+	apiServer := &server.Server{Client: client, Credentials: credentials}
+	monitorCtx, cancelMonitor := context.WithCancel(context.Background())
+	defer cancelMonitor()
+	go apiServer.RunNodeHealthMonitor(monitorCtx)
+	httpServer := &http.Server{Addr: *listen, Handler: apiServer, ReadHeaderTimeout: 5 * time.Second}
 	log.Fatal(httpServer.ListenAndServeTLS(*cert, *key))
 }

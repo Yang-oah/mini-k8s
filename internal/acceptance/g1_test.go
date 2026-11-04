@@ -411,10 +411,12 @@ func TestG1(t *testing.T) {
 			f.call("POST", "nodes", admin, object{"apiVersion": "mini.k8s/v1", "kind": "Node", "metadata": object{"name": name}, "spec": object{"allocatable": object{"cpuMilli": 1000, "memoryBytes": 100000}, "podCIDR": "10.8.0.0/24"}}, 201)
 		}
 		n := f.call("GET", "nodes/"+f.node, admin, nil, 200)
-		f.call("PUT", "nodes/"+f.node+"/status", agent, object{"resourceVersion": resourceVersionOf(n), "status": object{"ready": true, "reserved": object{"cpuMilli": 0, "memoryBytes": 0}}}, 200)
 		p := f.call("GET", "pods/"+f.pod, admin, nil, 200)
 		req := object{"nodeName": f.node, "nodeUID": uidOf(n), "podUID": uidOf(p), "resourceVersion": resourceVersionOf(p)}
 		f.call("POST", "pods/"+f.pod+"/bind", admin, req, 403)
+		// 静态测试节点没有后台 Agent，绑定前模拟一次有效心跳。
+		n = f.call("GET", "nodes/"+f.node, admin, nil, 200)
+		f.call("PUT", "nodes/"+f.node+"/status", agent, object{"resourceVersion": resourceVersionOf(n), "status": object{"ready": true, "reserved": object{"cpuMilli": 0, "memoryBytes": 0}}}, 200)
 		f.call("POST", "pods/"+f.pod+"/bind", scheduler, req, 200)
 		f.call("POST", "pods/"+f.pod+"/bind", scheduler, req, 200)
 		n = f.call("GET", "nodes/"+f.node, admin, nil, 200)
