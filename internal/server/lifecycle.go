@@ -193,6 +193,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request, kind, name strin
 		respondError(409, "Conflict", "resourceVersion conflict")
 		return
 	}
+	compares := []clientv3.Cmp{clientv3.Compare(clientv3.ModRevision(resourceKey(kind, name)), "=", req.ResourceVersion)}
 	switch v := old.value.(type) {
 	case *api.Pod:
 		var st api.PodStatus
@@ -214,6 +215,34 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request, kind, name strin
 			respondError(409, "Conflict", "terminal Pod cannot change phase")
 			return
 		}
+		if st.Ready {
+			// 证明必须来自当前分配节点的当前就绪代次；与 Pod 一起比较节点版本，
+			// 防止检查后节点失联或同名重建再提交旧探针结果。
+			nodeKey := resourceKey("nodes", who.node)
+			nodeResult, err := s.Client.Get(ctx, nodeKey)
+			if err != nil {
+				respondError(503, "Unavailable", "storage unavailable")
+				return
+			}
+			if len(nodeResult.Kvs) != 1 {
+				respondError(409, "Conflict", "assigned node no longer exists")
+				return
+			}
+			nodeObject, err := decode(nodeResult.Kvs[0].Value, "nodes", nodeResult.Kvs[0].ModRevision)
+			if err != nil {
+				respondError(503, "Unavailable", "invalid stored node")
+				return
+			}
+			node := nodeObject.value.(*api.Node)
+			if v.Metadata.DeletionTimestamp != nil || v.NodeUID != node.Metadata.UID || !nodeAvailable(node, time.Now()) || node.Status.ReadinessEpoch == 0 || st.ReadinessEpoch != node.Status.ReadinessEpoch {
+				respondError(409, "Conflict", "readiness proof is stale or node is unavailable")
+				return
+			}
+			compares = append(compares, clientv3.Compare(clientv3.ModRevision(nodeKey), "=", nodeResult.Kvs[0].ModRevision))
+		} else {
+			// 非 Ready 状态不携带可被误用的旧证明，兼容旧 Agent。
+			st.ReadinessEpoch = 0
+		}
 		v.Status = st
 	case *api.Node:
 		var st api.NodeStatus
@@ -226,8 +255,17 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request, kind, name strin
 			respondError(403, "Forbidden", "reservation is a system field")
 			return
 		}
+		// 即使迟到心跳先于扫描器到达，也在同一次 CAS 中失效旧探针证明。
+		now := time.Now().UTC()
+		if v.Status.ReadinessEpoch == 0 || v.Status.Ready != st.Ready || (!nodeHeartbeatFresh(v, now) && v.Status.Condition != "Unknown") {
+			if !advanceReadinessEpoch(v) {
+				respondError(409, "Conflict", "node readiness epoch exhausted")
+				return
+			}
+		}
+		st.ReadinessEpoch = v.Status.ReadinessEpoch
 		// 只信任控制面的接收时间，客户端时钟不能延长租期。
-		st.LastHeartbeat = time.Now().UTC()
+		st.LastHeartbeat = now
 		if st.Ready {
 			st.Condition = "Ready"
 		} else {
@@ -235,7 +273,7 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request, kind, name strin
 		}
 		v.Status = st
 	}
-	res, err := s.Client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(resourceKey(kind, name)), "=", req.ResourceVersion)).Then(clientv3.OpPut(resourceKey(kind, name), encodeObject(old))).Commit()
+	res, err := s.Client.Txn(ctx).If(compares...).Then(clientv3.OpPut(resourceKey(kind, name), encodeObject(old))).Commit()
 	if err != nil {
 		respondError(503, "Unavailable", "storage unavailable")
 		return

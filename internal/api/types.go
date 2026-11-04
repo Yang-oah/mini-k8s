@@ -49,11 +49,13 @@ type PodSpec struct {
 
 // PodStatus 保存系统观察到的运行状态，不属于用户声明。
 type PodStatus struct {
-	Phase        string `json:"phase,omitempty"`
-	Reason       string `json:"reason,omitempty"`
-	Ready        bool   `json:"ready,omitempty"`
-	PodIP        string `json:"podIP,omitempty"`
-	RestartCount int64  `json:"restartCount,omitempty"`
+	Phase  string `json:"phase,omitempty"`
+	Reason string `json:"reason,omitempty"`
+	Ready  bool   `json:"ready,omitempty"`
+	// ReadinessEpoch 将本次成功探针与节点的就绪代次绑定；不是完整的节点会话栅栏。
+	ReadinessEpoch uint64 `json:"readinessEpoch,omitempty"`
+	PodIP          string `json:"podIP,omitempty"`
+	RestartCount   int64  `json:"restartCount,omitempty"`
 }
 
 // Pod 将用户声明、系统绑定和实际状态分开保存。
@@ -104,10 +106,12 @@ type NodeSpec struct {
 
 // NodeStatus 保存节点就绪状态、心跳和系统维护的已预留资源。
 type NodeStatus struct {
-	Ready         bool      `json:"ready"`
-	Condition     string    `json:"condition,omitempty"`
-	LastHeartbeat time.Time `json:"lastHeartbeat,omitempty"`
-	Reserved      Resources `json:"reserved"`
+	Ready     bool   `json:"ready"`
+	Condition string `json:"condition,omitempty"`
+	// ReadinessEpoch 由控制面维护，失联或重新就绪时改变，旧探针结果随之失效。
+	ReadinessEpoch uint64    `json:"readinessEpoch,omitempty"`
+	LastHeartbeat  time.Time `json:"lastHeartbeat,omitempty"`
+	Reserved       Resources `json:"reserved"`
 }
 
 // Node 表示由控制面管理、Agent 上报状态的节点。
