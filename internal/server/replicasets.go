@@ -78,16 +78,21 @@ func (s *Server) deleteReplicaSet(ctx context.Context, w http.ResponseWriter, rs
 	rsKey := resourceKey("replicasets", rs.meta.Name)
 	compares := []clientv3.Cmp{clientv3.Compare(clientv3.ModRevision(rsKey), "=", rs.meta.ResourceVersion)}
 	var operations []clientv3.Op
+	fenceCompares, fenceOps, err := s.deletionOperationFence(ctx, rs.meta.UID)
+	if err != nil {
+		respondError(503, "Unavailable", "cannot resolve pending create")
+		return
+	}
+	compares = append(compares, fenceCompares...)
+	operations = append(operations, fenceOps...)
 	result := "deleted"
 	if hasChildren {
-		if rs.meta.DeletionTimestamp != nil {
-			writeJSON(w, map[string]string{"result": "terminating"})
-			return
+		if rs.meta.DeletionTimestamp == nil {
+			// 有子 Pod 时保留 RS 和所有权，直到 Controller 确认全部回收。
+			now := time.Now().UTC()
+			rs.meta.DeletionTimestamp = &now
+			operations = append(operations, clientv3.OpPut(rsKey, encodeObject(rs)))
 		}
-		// 有子 Pod 时保留 RS 和所有权，直到 Controller 确认全部回收。
-		now := time.Now().UTC()
-		rs.meta.DeletionTimestamp = &now
-		operations = append(operations, clientv3.OpPut(rsKey, encodeObject(rs)))
 		result = "terminating"
 	} else {
 		compares = append(compares, clientv3.Compare(clientv3.ModRevision(childCreationKey(rs.meta.UID)), "=", markerRevision))
@@ -147,12 +152,17 @@ func (s *Server) finalizeReplicaSet(w http.ResponseWriter, r *http.Request, name
 		respondError(409, "Conflict", "ReplicaSet still has children")
 		return
 	}
+	fenceCompares, fenceOps, err := s.deletionOperationFence(ctx, request.UID)
+	if err != nil {
+		respondError(503, "Unavailable", "cannot resolve pending create")
+		return
+	}
 	// 包括删除标记中的 Pod 在内的所有子对象都必须消失，才能释放 RS 名称。
+	compares := append([]clientv3.Cmp{clientv3.Compare(clientv3.ModRevision(rsKey), "=", request.ResourceVersion), clientv3.Compare(clientv3.ModRevision(childCreationKey(request.UID)), "=", markerRevision)}, fenceCompares...)
+	operations := append(fenceOps, clientv3.OpDelete(rsKey), clientv3.OpDelete(childCreationKey(request.UID)), clientv3.OpPut(prefix+"replicaset-selector-revision", newUID()))
 	txn, err := s.Client.Txn(ctx).
-		If(clientv3.Compare(clientv3.ModRevision(rsKey), "=", request.ResourceVersion),
-			clientv3.Compare(clientv3.ModRevision(childCreationKey(request.UID)), "=", markerRevision)).
-		Then(clientv3.OpDelete(rsKey), clientv3.OpDelete(childCreationKey(request.UID)),
-			clientv3.OpPut(prefix+"replicaset-selector-revision", newUID())).
+		If(compares...).
+		Then(operations...).
 		Commit()
 	if err != nil {
 		respondError(503, "Unavailable", "storage unavailable")

@@ -1,6 +1,6 @@
 # 开发与代码阅读指南
 
-本文说明 G1 已实现部分的代码组织和维护约定。项目范围及后续阶段以 [Plan.md](../Plan.md) 为准，验收口径以 [Gateway.md](../Gateway.md) 为准。
+本文说明 G1 已实现部分的代码组织和维护约定。项目范围及后续阶段以 [Plan.md](../Plan.md) 为准，验收口径以 [Gateway.md](../Gateway.md) 为准。Controller、Agent 和 R1 的创建操作不在下面这张表里，分别看 [AGENT.md](../AGENT.md) 的代码地图和 [R1 详细设计](r1-reliability-design.md)。
 
 ## 从哪里开始阅读
 

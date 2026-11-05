@@ -286,12 +286,35 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.finalizeReplicaSet(w, r, name, respondError)
 		return
 	}
+	if action == "create-operation" {
+		if who.role != "controller" || kind != "replicasets" || name == "" {
+			respondError(403, "Forbidden", "create operation requires controller identity")
+			return
+		}
+		s.replicaCreateOperation(w, r, name, respondError)
+		return
+	}
+	if action == "create-operation-gc" {
+		if who.role != "admin" || r.Method != http.MethodPost || kind != "replicasets" || name == "" {
+			respondError(403, "Forbidden", "operation collection requires administrator identity")
+			return
+		}
+		s.gcReplicaOperation(w, r, name, respondError)
+		return
+	}
+	if action == "create-operation-owner-gc" {
+		if who.role != "admin" || r.Method != http.MethodPost || kind != "replicasets" || name == "" {
+			respondError(403, "Forbidden", "operation owner collection requires administrator identity")
+			return
+		}
+		s.gcReplicaOperationOwner(w, r, name, respondError)
+		return
+	}
 	if action != "" {
 		respondError(404, "NotFound", "unknown action")
 		return
 	}
-	controllerPodWrite := who.role == "controller" && kind == "pods" &&
-		((r.Method == "POST" && name == "") || (r.Method == "DELETE" && name != ""))
+	controllerPodWrite := who.role == "controller" && kind == "pods" && r.Method == "DELETE" && name != ""
 	if r.Method != "GET" && who.role != "admin" && !controllerPodWrite {
 		respondError(403, "Forbidden", "write not authorized")
 		return

@@ -214,6 +214,11 @@ func (c *Controller) reconcile(ctx context.Context, rs api.ReplicaSet) error {
 	if rs.Metadata.UID == "" {
 		return errors.New("ReplicaSet has no UID")
 	}
+	// 未决操作必须先恢复；查询错误时不得继续删除、缩容或发起新操作。
+	pending, err := c.pendingCreate(ctx, rs)
+	if err != nil {
+		return err
+	}
 	pods, err := c.listPods(ctx)
 	if err != nil {
 		return err
@@ -227,6 +232,14 @@ func (c *Controller) reconcile(ctx context.Context, rs api.ReplicaSet) error {
 			owned = append(owned, pod)
 		}
 	}
+	if pending != nil {
+		// 缩容、删除或已无缺口时，通过与提交竞争的 CAS 取消旧意图。
+		// 本轮无论取消还是提交均结束，下一轮重新读取，不使用旧快照。
+		if rs.Metadata.DeletionTimestamp != nil || pending.RSVersion != rs.Metadata.ResourceVersion || len(owned) >= rs.Spec.Replicas {
+			return c.cancelCreate(ctx, rs, *pending)
+		}
+		return c.commitCreate(ctx, rs, *pending)
+	}
 	if rs.Metadata.DeletionTimestamp != nil {
 		return c.deleteReplicaSetPods(ctx, rs, pods.Items)
 	}
@@ -236,7 +249,7 @@ func (c *Controller) reconcile(ctx context.Context, rs api.ReplicaSet) error {
 	if len(owned) >= rs.Spec.Replicas {
 		return nil
 	}
-	return c.createPod(ctx, rs, usedNames)
+	return c.createPod(ctx, rs, usedNames, pods.ResourceVersion)
 }
 
 // deleteReplicaSetPods 等所有子 Pod 真正消失后再请求 API 完成删除。
@@ -297,29 +310,112 @@ func (c *Controller) scaleDown(ctx context.Context, owned []api.Pod, desired int
 	return nil
 }
 
-func (c *Controller) createPod(ctx context.Context, rs api.ReplicaSet, usedNames map[string]bool) error {
-	// 每轮最多创建一个确定名称的 Pod。响应丢失时查询同名对象；
-	// 仍无法确认则等待下轮重新读取，不换名尝试，避免重复创建。
+func (c *Controller) createPod(ctx context.Context, rs api.ReplicaSet, usedNames map[string]bool, podListRevision int64) error {
+	// 服务端持久化准备意图。结果未知时下一轮查询该 RS 的原意图，
+	// 不以本地的新名称替换，也不通过原始 Pod 创建接口绕过事务。
 	name := nextPodName(rs.Metadata.UID, usedNames)
-	pod := api.Pod{
-		APIVersion: api.Version,
-		Kind:       "Pod",
-		Metadata: api.Metadata{
-			Name: name, Namespace: rs.Metadata.Namespace, OwnerUID: rs.Metadata.UID,
-			Labels: rs.Spec.Template.Labels, Annotations: rs.Spec.Template.Annotations,
-		},
-		Spec: rs.Spec.Template.Spec,
+	var operation createOperation
+	_, err := c.call(ctx, http.MethodPost, operationPath(rs), map[string]any{
+		"uid": rs.Metadata.UID, "resourceVersion": rs.Metadata.ResourceVersion, "podName": name, "podListRevision": podListRevision,
+	}, &operation)
+	if err != nil {
+		return fmt.Errorf("prepare create unconfirmed; query pending next reconciliation: %w", err)
 	}
-	_, err := c.call(ctx, http.MethodPost, "pods", pod, nil)
-	if err == nil {
+	if err := validateOperation(rs, operation); err != nil {
+		return err
+	}
+	switch operation.State {
+	case "PREPARED":
+		return c.commitCreate(ctx, rs, operation)
+	case "COMMITTED":
+		if operation.PodUID == "" {
+			return errors.New("committed create operation has no Pod UID")
+		}
+		// 服务端重放了旧结果；本轮不再使用原快照决定是否补建。
 		return nil
-	}
-	var found api.Pod
-	_, readErr := c.call(ctx, http.MethodGet, "pods/"+url.PathEscape(name), nil, &found)
-	if readErr == nil && found.Metadata.OwnerUID == rs.Metadata.UID {
+	case "CANCELLED":
 		return nil
+	default:
+		return fmt.Errorf("unexpected prepared operation state %q", operation.State)
 	}
-	return fmt.Errorf("create %s unconfirmed; retry same slot after relist: %w", name, err)
+}
+
+// createOperation 是 API 持久化的创建意图；操作身份在控制器重启后仍有效。
+type createOperation struct {
+	UID         string `json:"uid"`
+	RSVersion   int64  `json:"rsVersion"`
+	OperationID int64  `json:"operationID"`
+	PodName     string `json:"podName"`
+	State       string `json:"state"`
+	PodUID      string `json:"podUID"`
+}
+
+func operationPath(rs api.ReplicaSet) string {
+	return "replicasets/" + url.PathEscape(rs.Metadata.Name) + "/create-operation"
+}
+
+func validateOperation(rs api.ReplicaSet, op createOperation) error {
+	if op.UID != rs.Metadata.UID || op.RSVersion <= 0 || op.OperationID <= 0 || op.PodName == "" {
+		return errors.New("create operation identity is invalid")
+	}
+	return nil
+}
+
+func (c *Controller) pendingCreate(ctx context.Context, rs api.ReplicaSet) (*createOperation, error) {
+	var op createOperation
+	status, err := c.call(ctx, http.MethodGet, operationPath(rs)+"?uid="+url.QueryEscape(rs.Metadata.UID), nil, &op)
+	if status == http.StatusNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("query pending create: %w", err)
+	}
+	if err := validateOperation(rs, op); err != nil {
+		return nil, err
+	}
+	if op.State != "PREPARED" {
+		return nil, fmt.Errorf("unexpected pending create state %q", op.State)
+	}
+	return &op, nil
+}
+
+func (c *Controller) commitCreate(ctx context.Context, rs api.ReplicaSet, op createOperation) error {
+	var result createOperation
+	_, err := c.call(ctx, http.MethodPut, operationPath(rs), map[string]any{
+		"uid": rs.Metadata.UID, "operationID": op.OperationID, "podName": op.PodName,
+	}, &result)
+	if err != nil {
+		// 响应丢失不代表提交失败；以原操作身份查询，不允许换 ID。
+		path := operationPath(rs) + "?uid=" + url.QueryEscape(rs.Metadata.UID) + "&operationID=" + strconv.FormatInt(op.OperationID, 10)
+		if _, queryErr := c.call(ctx, http.MethodGet, path, nil, &result); queryErr != nil {
+			return fmt.Errorf("create outcome unknown: %w", err)
+		}
+	}
+	if err := validateOperation(rs, result); err != nil {
+		return err
+	}
+	if result.OperationID != op.OperationID || result.PodName != op.PodName || result.State != "COMMITTED" || result.PodUID == "" {
+		return fmt.Errorf("create operation %d not confirmed committed", op.OperationID)
+	}
+	return nil
+}
+
+func (c *Controller) cancelCreate(ctx context.Context, rs api.ReplicaSet, op createOperation) error {
+	var result createOperation
+	_, err := c.call(ctx, http.MethodDelete, operationPath(rs), map[string]any{
+		"uid": rs.Metadata.UID, "operationID": op.OperationID,
+	}, &result)
+	if err != nil {
+		// 下轮重新查询；取消响应丢失或与提交竞争不能视作取消成功。
+		return fmt.Errorf("cancel create outcome unknown: %w", err)
+	}
+	if err := validateOperation(rs, result); err != nil {
+		return err
+	}
+	if result.OperationID != op.OperationID || result.PodName != op.PodName || result.State != "CANCELLED" {
+		return fmt.Errorf("create operation %d not confirmed cancelled", op.OperationID)
+	}
+	return nil
 }
 
 func nextPodName(uid string, used map[string]bool) string {

@@ -262,18 +262,28 @@ func (s *Server) delete(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		respondError(403, "Forbidden", "controller requires matching owned Pod UID")
 		return
 	}
+	// 显式提供 UID 时，所有调用者均必须匹配，避免同名对象重建后误删。
+	if requested := r.URL.Query().Get("uid"); requested != "" && requested != old.meta.UID {
+		respondError(409, "Conflict", "resource UID mismatch")
+		return
+	}
 	if kind == "replicasets" {
 		s.deleteReplicaSet(ctx, w, old, respondError)
 		return
 	}
-	op := clientv3.OpDelete(k)
+	ops := []clientv3.Op{clientv3.OpDelete(k)}
 	// 已绑定 Pod 必须保留删除标记，直到对应节点确认清理并释放预留。
 	if p, ok := old.value.(*api.Pod); ok && p.NodeUID != "" {
 		if old.meta.DeletionTimestamp == nil {
 			now := time.Now().UTC()
 			old.meta.DeletionTimestamp = &now
+			if p.Metadata.OwnerUID != "" {
+				// 带绑定的终态 Pod 开始删除后重新占用副本额度；
+				// 同事务推进标记，使基于旧快照的创建操作无法提交。
+				ops = append(ops, clientv3.OpPut(childCreationKey(p.Metadata.OwnerUID), p.Metadata.UID))
+			}
 		}
-		op = clientv3.OpPut(k, encodeObject(old))
+		ops[0] = clientv3.OpPut(k, encodeObject(old))
 	}
 	compares := []clientv3.Cmp{clientv3.Compare(clientv3.ModRevision(k), "=", old.meta.ResourceVersion)}
 	if service, ok := old.value.(*api.Service); ok && service.Spec.ClusterIP != "" {
@@ -281,7 +291,7 @@ func (s *Server) delete(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		// 服务对象和声明的 UID 必须同时匹配，避免删除同名重建的资源。
 		compares = append(compares, clientv3.Compare(clientv3.Value(serviceClaimPrefix+service.Spec.ClusterIP), "=", old.meta.UID))
 	}
-	res, err := s.Client.Txn(ctx).If(compares...).Then(op).Commit()
+	res, err := s.Client.Txn(ctx).If(compares...).Then(ops...).Commit()
 	if err != nil {
 		respondError(503, "Unavailable", "storage unavailable")
 		return
