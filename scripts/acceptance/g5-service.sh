@@ -14,7 +14,7 @@ token="${G5_ADMIN_TOKEN_FILE:-}"
 duration="${G5_OBSERVE_DURATION:-300s}"
 interval="${G5_OBSERVE_INTERVAL:-200ms}"
 state='NOT_RUN'
-reason='API sampling alone does not prove TCP routing, endpoint identity, cleanup or G5 acceptance.'
+reason='API sampling does not determine TCP routing, endpoint identity, cleanup or the G5 gate.'
 
 if [[ -z "$probe" || ! -x "$probe" || -z "$server" || ! -r "$ca" || ! -r "$token" ]]; then
   reason='Set G5_PROBE, G5_API, G5_CA_FILE and G5_ADMIN_TOKEN_FILE to test-cluster values.'
@@ -28,9 +28,9 @@ fi
 
 {
   printf '# G5 Service evidence collection\n\n'
-  printf -- '- Result: BLOCKED\n- Started (UTC): %s\n- Finished (UTC): %s\n' "$started" "$(date -u +%FT%TZ)"
-  printf -- '- API observation: %s\n- Details: %s\n' "$state" "$reason"
+  printf -- '- Collection: %s\n- Gate: NOT_EVALUATED\n- Started (UTC): %s\n- Finished (UTC): %s\n' "$state" "$started" "$(date -u +%FT%TZ)"
+  printf -- '- Details: %s\n' "$reason"
   printf '\n%s\n' '- This collector does not decide Service or the G5 gate; see docs/g5-service.md.'
 } >"$out/G5-service.md"
-printf 'BLOCKED: %s\nEvidence: %s\n' "$reason" "$out"
-exit 2
+printf 'Collection: %s; G5 gate: NOT_EVALUATED\n%s\nEvidence: %s\n' "$state" "$reason" "$out"
+case "$state" in CAPTURED) exit 0 ;; FAILED) exit 1 ;; *) exit 2 ;; esac

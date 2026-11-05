@@ -22,12 +22,14 @@ cat >"$tmp/bin/crictl" <<'EOF'
 printf '%s\n' "$*" >>"$G5_TEST_ARGS"
 case " $* " in
   *' logs '*) if [[ "${G5_TEST_LARGE_LOGS:-}" == 1 ]]; then printf '%02048d\n' 0; else printf 'test container log\n'; fi ;;
+  *' inspect '*) printf '%s\n' '{"status":{"id":"aaaaaaaaaaaa","state":"CONTAINER_EXITED","exitCode":137,"reason":"OOMKilled","startedAt":"2026-11-04T14:15:43.193481Z","finishedAt":"2026-11-04T14:24:54.055480Z","metadata":{"attempt":0},"resources":{"linux":{"memoryLimitInBytes":"67108864"}}}}' ;;
+  *' ps '*) if [[ "${G5_TEST_EXITED:-}" == 1 ]]; then printf '%s\n' '{"containers":[{"id":"aaaaaaaaaaaa","state":"CONTAINER_EXITED","metadata":{"name":"app","attempt":0}}]}'; else printf '%s\n' '{"containers":[]}'; fi ;;
   *) printf '{"items":[]}\n' ;;
 esac
 EOF
 cat >"$tmp/bin/iptables-save" <<'EOF'
 #!/usr/bin/env bash
-if [[ "${2:-}" == filter ]]; then printf 'permission denied\n' >&2; exit 4; fi
+if [[ "${2:-}" == filter && "${G5_TEST_RULES_OK:-}" != 1 ]]; then printf 'permission denied\n' >&2; exit 4; fi
 printf '%s\n' ':MK8S-SVC - [0:0]' '-A MK8S-SVC -j RETURN' '-A FORWARD -j UNRELATED'
 EOF
 cat >"$tmp/bin/date" <<'EOF'
@@ -81,6 +83,45 @@ grep -q '^last_sample_start=20' "$out/session.txt"
 grep -q '^last_sample_finish=20' "$out/session.txt"
 grep -Eq '^max_sample_interval_ns=[0-9]+$' "$out/session.txt"
 grep -qx 'window_coverage=NOT_ASSERTED' "$out/session.txt"
+grep -qx 'exit_observations=0' "$out/session.txt"
+grep -qx 'oom_observations=0' "$out/session.txt"
+grep -qx 'exit=0' "$first/exits-pod-a.meta"
+[[ ! -e "$first/exits.meta" ]]
+
+# 完整规则采样必须全部成功才能产生 READY；它不等于 Gate PASS。
+blocked="$tmp/readiness-blocked"
+set +e
+bash "$script_dir/g5-node-evidence.sh" --output "$blocked" --lease-dir "$tmp/leases" \
+  --cri-endpoint unix:///tmp/cri.sock --iptables full --tool-dir "$tmp/bin" --duration 1 >/dev/null
+blocked_rc=$?
+set -e
+[[ $blocked_rc -eq 1 && ! -e "$blocked/READY" ]] || { printf 'failed required sample produced READY\n' >&2; exit 1; }
+ready="$tmp/readiness-ready"
+G5_TEST_RULES_OK=1 bash "$script_dir/g5-node-evidence.sh" --output "$ready" --lease-dir "$tmp/leases" \
+  --cri-endpoint unix:///tmp/cri.sock --iptables full --tool-dir "$tmp/bin" --duration 1 >/dev/null
+grep -qx 'gate=NOT_EVALUATED' "$ready/READY"
+
+exited="$tmp/exited"
+set +e
+G5_TEST_EXITED=1 bash "$script_dir/g5-node-evidence.sh" --output "$exited" --lease-dir "$tmp/leases" \
+  --cri-endpoint unix:///tmp/cri.sock --tool-dir "$tmp/bin" --duration 1 >"$tmp/exited.out" 2>"$tmp/exited.err"
+collector_rc=$?
+set -e
+grep -q 'exit-observed id=aaaaaaaaaaaa ' "$tmp/exited.err"
+grep -q 'reason=OOMKilled' "$tmp/exited.err"
+[[ -f "$exited/sample-000001/exits.txt" ]]
+grep -q 'id=aaaaaaaaaaaa ' "$exited/sample-000001/exits.txt"
+grep -q 'reason=OOMKilled' "$exited/sample-000001/exits.txt"
+grep -q 'exitCode=137' "$exited/sample-000001/exits.txt"
+grep -q 'memoryLimitBytes=67108864' "$exited/sample-000001/exits.txt"
+grep -q 'oom=true' "$exited/sample-000001/exits.txt"
+grep -q 'captureKernel=true' "$exited/sample-000001/exits.txt"
+[[ -f "$exited/sample-000001/oom-kernel.meta" ]]
+[[ -f "$exited/sample-000001/oom-containerd.meta" ]]
+grep -q '^exit=' "$exited/sample-000001/oom-kernel.meta"
+grep -q 'oom_observations=[1-9]' "$exited/session.txt"
+# 采集器退出码仍不是 Gate 结论；内核命令失败只说明摘录未完成。
+[[ "$collector_rc" == 0 || "$collector_rc" == 1 ]]
 if [[ -f "$out/sample-000002/sample.meta" ]]; then
   grep -Eq '^previous_start_interval_ns=[0-9]+$' "$out/sample-000002/sample.meta"
 fi

@@ -1,6 +1,6 @@
 # 两节点运行与排障指南（G5 开发版）
 
-本文面向隔离测试环境，说明当前代码的配置和运行方式；文档、示例和命令尚未在最终版本上完整复验，不能用作 G5 通过证明。G5 完成前仍需按 [Gateway.md](../Gateway.md) 在同一最终版本上验证 G1–G5。项目不是 Kubernetes API 的兼容实现，不适合生产环境。
+本文面向隔离测试环境，说明当前代码的配置和运行方式。2026-11-05 用这份源码在控制面按下面的变量步骤建成一套只监听 `127.0.0.1:18443` 的临时集群：etcd 健康、六个程序完成构建、`mini get nodes` 成功，并完成 [examples/g5-replicaset.yaml](../examples/g5-replicaset.yaml) 与 [examples/g5-service.yaml](../examples/g5-service.yaml) 的创建、`scale rs g5-demo --replicas 0` 和删除。该临时目录随后已清掉，没有连接 `10.128.176.165:8443` 上的验收集群。Worker 上的 Agent 和 Proxy 命令与当前程序参数一致，但验收集群已经占用 CRI、状态目录和项目 iptables 链，这次没有再启动第二套。因此本文还不能单独作为 G5 通过证明。项目不是 Kubernetes API 的兼容实现，不适合生产环境。
 
 ## 准备环境
 
@@ -17,11 +17,15 @@ Proxy 使用本机 iptables 项目专用链。启动前保存两台 Worker 的�
 ```sh
 umask 077
 export MINI_K8S_DIR="$(mktemp -d)"
-# 填入两个 Worker 实际连接的控制面 IPv4 地址；192.0.2.10 是示例。
+# 填入两个 Worker 实际连接的控制面 IPv4 地址。只在本机验证 API 时可用 127.0.0.1。192.0.2.10 是示例。
 export G5_API_IP='192.0.2.10'
-export G5_API="https://${G5_API_IP}:8443"
-export G5_LISTEN="${G5_API_IP}:8443"
+export G5_API_PORT='8443'
+export G5_API="https://${G5_API_IP}:${G5_API_PORT}"
+export G5_LISTEN="${G5_API_IP}:${G5_API_PORT}"
 export G5_SERVICE_CIDR='10.96.0.0/24'
+# 默认使用空闲的回环端口。已被其他 etcd 占用时改成未使用的回环端口，不要连接已有数据目录。
+export G5_ETCD_CLIENT_URL='http://127.0.0.1:2379'
+export G5_ETCD_PEER_URL='http://127.0.0.1:2380'
 
 openssl req -x509 -newkey rsa:3072 -nodes -days 1 \
   -keyout "$MINI_K8S_DIR/ca.key" -out "$MINI_K8S_DIR/ca.pem" \
@@ -67,25 +71,25 @@ go build -o "$MINI_K8S_DIR/bin/mini-proxy" ./cmd/mini-proxy
 
 ## 按顺序启动
 
-先启动测试专用 etcd；当前 API 没有配置 etcd TLS 的参数，因此只在控制面本机回环监听，不向网络暴露。确认 `2379`、`2380` 空闲后再执行：
+先启动测试专用 etcd；当前 API 没有配置 etcd TLS 的参数，因此只在控制面本机回环监听，不向网络暴露。确认 `G5_ETCD_CLIENT_URL` 和 `G5_ETCD_PEER_URL` 的端口空闲后再执行：
 
 ```sh
 etcd --data-dir "$MINI_K8S_DIR/etcd" \
-  --listen-client-urls http://127.0.0.1:2379 \
-  --advertise-client-urls http://127.0.0.1:2379 \
-  --listen-peer-urls http://127.0.0.1:2380 \
-  --initial-advertise-peer-urls http://127.0.0.1:2380 \
-  --initial-cluster default=http://127.0.0.1:2380 \
+  --listen-client-urls "$G5_ETCD_CLIENT_URL" \
+  --advertise-client-urls "$G5_ETCD_CLIENT_URL" \
+  --listen-peer-urls "$G5_ETCD_PEER_URL" \
+  --initial-advertise-peer-urls "$G5_ETCD_PEER_URL" \
+  --initial-cluster "default=${G5_ETCD_PEER_URL}" \
   > "$MINI_K8S_DIR/etcd.log" 2>&1 &
 ETCD_PID=$!
-etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
+etcdctl --endpoints="$G5_ETCD_CLIENT_URL" endpoint health
 ```
 
 确认 etcd 健康后启动 API、manager 和 scheduler；`-service-cidr` 使用经现场确认的 IPv4 `/16` 到 `/30` 规范网段。空配置不能创建 Service。一旦地址池首次写入 etcd，同一个集群不能随意换成另一个池。
 
 ```sh
 "$MINI_K8S_DIR/bin/mini-api" -listen "$G5_LISTEN" \
-  -etcd http://127.0.0.1:2379 -tls-cert "$MINI_K8S_DIR/server.pem" \
+  -etcd "$G5_ETCD_CLIENT_URL" -tls-cert "$MINI_K8S_DIR/server.pem" \
   -tls-key "$MINI_K8S_DIR/server.key" -auth-file "$MINI_K8S_DIR/auth.json" \
   -service-cidr "$G5_SERVICE_CIDR" > "$MINI_K8S_DIR/api.log" 2>&1 &
 API_PID=$!
@@ -99,7 +103,7 @@ mini() { "$MINI_K8S_DIR/bin/mini-k8s" --server "$G5_API" --ca-file "$MINI_K8S_DI
 mini get nodes
 ```
 
-管理员先注册 `node-a` 和 `node-b`，对应的令牌名必须与身份文件中的节点名一致。按 [G4 的节点注册示例](g4.md#测试集群启动配置)准备两份 Node 清单；清单中的 allocatable 必须符合实际可用容量，PodCIDR 必须与该 Worker 的 CNI 配置一致，不能与 Service CIDR 重叠。先 `mini apply -f <已核对节点清单>`，再在各 Worker 设置各自本地文件路径并启动 Agent、Proxy：
+管理员先注册 `node-a` 和 `node-b`，对应的令牌名必须与身份文件中的节点名一致。按 [G4 的节点注册示例](g4.md#测试集群启动配置)准备两份 Node 清单；清单中的 allocatable 必须符合实际可用容量，PodCIDR 必须与该 Worker 的 CNI 配置一致，不能与 Service CIDR 重叠。先 `mini apply -f <已核对节点清单>`，再在各 Worker 设置各自本地文件路径并启动 Agent、Proxy。下面的命令会占用该 Worker 的 CRI、状态目录和项目 iptables 链；已有 Agent 或 Proxy 在使用这些路径时，不要再启动第二套。
 
 ```sh
 # 在每个 Worker 单独设置；API、CA、代理令牌路径按现场填写。
@@ -143,7 +147,7 @@ mini get svc g5-demo
 
 - **Pod Pending、资源不足**：记录 Pod 的 reason、UID、绑定和资源请求，比较 `mini get nodes` 中两侧 allocatable/reserved、节点 Ready 和 unschedulable。确认后从 scheduler、controller、API 日志查证；不要手工绑定替代正式调度。
 - **Pod Running 但 NotReady**：确认 readiness 端口、镜像启动行为、Pod IP、CRI 运行实例；在对应 Worker 根据 Pod UID 查询 `sudo crictl pods -o json`、`sudo crictl ps -a -o json` 后核对 ID，再用 `sudo crictl inspect <已核对容器ID>` 和 `sudo crictl logs <已核对容器ID>`。Agent 日志中的 `first_failure`、`failure_threshold`、`recovered` 可与 API 和容器时间线关联；旧容器或旧节点 epoch 的成功结果不能证明当前就绪。
-- **OOMKilled/退出码 137**：先记录该 Pod UID、节点、sandbox 与新旧 container ID，核对 `crictl inspect` 中退出原因、退出码和时间，保留该实例 workload 日志与其 requests/limits；需要时由节点管理员按时间查看 containerd/内核日志。区分容器被 OOM 杀死与其他 SIGKILL 原因。此前 64Mi 相关案例根因尚未确定，不能宣称已修复或盲目扩大限制。确认原因和受控环境后再制定改动，并重新进行该场景与 G5 验收。
+- **OOMKilled/退出码 137**：先看 Agent 日志里的 `exited reason=`，以及节点采集器的 `exits.txt`、`oom-kernel.out` 和 `oom-containerd.out`。记录 Pod UID、节点、sandbox、新旧 container ID、退出码、内存上限和 cgroup 用量。区分本容器 memory cgroup 被打满与宿主机整体缺内存。2026-11-04 的 g5c-a 是容器自己的 64 MiB cgroup 被打满：被杀进程用户态约 18 MiB，同一 cgroup 还有第二个测试进程约 12 MiB，另有内核栈等内核内存；随后同限的新容器处理了更多请求且没有再次 OOM。因此不能把所有 Pod 的内存上限一律提高，也不能宣称 64 MiB 对单个测试进程一定不够。确认具体容器和负载后再决定是否调整该容器上限，并重新验收。
 - **Service 访问失败**：先确认两个 Pod 是否 Ready、Pod 与 Node 的 `readinessEpoch` 相符、Service selector/ClusterIP/端口和两节点路由正确；在对应 Worker 核对相关 UID 的访问日志及 `iptables-save -t nat`、`-t filter`、`-t mangle` 项目专用链。Pod 自访问失败时检查该 Pod 对应 veth 的 hairpin；不要凭名称猜测或改动其他端口。保存规则前应考虑其包含其他工作负载的地址和规则，仅在受保护的证据目录留存。
 - **Service 地址耗尽**：当前删除 Service 后保留该 ClusterIP 的声明，避免离线 Proxy 的旧规则误投到新工作负载，因此地址不会自动回收。管理员可只读访问 `/api/mini/v1/service-pool` 检查 `active`、`retained` 和剩余容量；不能把 retained 当成已释放。不要手工删除租约或重置池来掩盖问题。
 

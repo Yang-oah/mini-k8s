@@ -1,12 +1,15 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -343,6 +346,28 @@ func TestRestartReportsPreviousExitReason(t *testing.T) {
 	}
 	if got := apiClient.pods["web"].Status; got.Phase != "Running" || got.Reason != "Error" || got.RestartCount != 1 || got.Ready {
 		t.Fatalf("restarted status = %+v", got)
+	}
+}
+
+func TestExitReasonIsLoggedOnce(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	oldFinish := time.Now().Add(-2 * time.Second)
+	pod := api.Pod{Metadata: api.Metadata{Name: "web", UID: "pod-1", ResourceVersion: 3}, NodeUID: "node-uid", Status: api.PodStatus{Phase: "Running", Ready: true}}
+	next := containerruntime.Observation{Exists: true, Running: true, ContainerID: "new", PodIP: "10.0.0.2", Attempt: 1}
+	runtime := &fakeRuntime{observed: containerruntime.Observation{Exists: true, Exited: true, ContainerID: "old", ExitReason: "OOMKilled", ExitCode: 137, Attempt: 0, StartedAt: oldFinish.Add(-time.Minute), FinishedAt: oldFinish}, ensuredResult: &next}
+	apiClient := &fakeAPI{pods: map[string]api.Pod{"web": pod}}
+	a := testAgent(t, runtime, apiClient)
+	if err := a.reconcilePod(context.Background(), "node-uid", pod); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.reconcilePod(context.Background(), "node-uid", apiClient.pods["web"]); err != nil {
+		t.Fatal(err)
+	}
+	text := buf.String()
+	if strings.Count(text, "exited") != 1 || !strings.Contains(text, "uid=pod-1") || !strings.Contains(text, "container=old") || !strings.Contains(text, "reason=\"OOMKilled\"") || !strings.Contains(text, "exitCode=137") {
+		t.Fatalf("exit log = %q", text)
 	}
 }
 

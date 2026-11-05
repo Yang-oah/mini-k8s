@@ -73,19 +73,30 @@ func (f *fixture) accept(listener net.Listener) {
 		if err != nil {
 			return
 		}
-		go func(c net.Conn) {
-			defer c.Close()
-			_ = c.SetDeadline(time.Now().Add(3 * time.Second))
-			line, err := bufio.NewReader(io.LimitReader(c, 32)).ReadString('\n')
-			if err != nil || line != "probe\n" { // readiness 的空连接不计为业务访问。
-				return
-			}
-			if err := json.NewEncoder(c).Encode(map[string]string{"identity": f.identity}); err != nil {
-				return
-			}
-			f.log(event{At: time.Now().UTC(), Kind: "request", Identity: f.identity, Source: c.RemoteAddr().String()})
-		}(conn)
+		go f.handleBusiness(conn)
 	}
+}
+
+// handleBusiness 记录业务请求和明确失败。空连接是就绪探针，不记为错误。
+func (f *fixture) handleBusiness(c net.Conn) {
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+	line, err := bufio.NewReader(io.LimitReader(c, 32)).ReadString('\n')
+	if err != nil {
+		if !errors.Is(err, io.EOF) {
+			f.log(event{At: time.Now().UTC(), Kind: "error", Identity: f.identity, Error: "read failed: " + err.Error()})
+		}
+		return
+	}
+	if line != "probe\n" {
+		f.log(event{At: time.Now().UTC(), Kind: "error", Identity: f.identity, Error: "unexpected request"})
+		return
+	}
+	if err := json.NewEncoder(c).Encode(map[string]string{"identity": f.identity}); err != nil {
+		f.log(event{At: time.Now().UTC(), Kind: "error", Identity: f.identity, Error: "response failed: " + err.Error()})
+		return
+	}
+	f.log(event{At: time.Now().UTC(), Kind: "request", Identity: f.identity, Source: c.RemoteAddr().String()})
 }
 
 func serve(args []string) error {

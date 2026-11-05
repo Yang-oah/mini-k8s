@@ -397,6 +397,7 @@ func (a *Agent) reconcilePod(ctx context.Context, nodeUID string, pod api.Pod) e
 		pod = current
 	}
 	if observation.Exited && observation.ContainerID != "" && state.containerID != observation.ContainerID {
+		log.Printf("agent pod uid=%s container=%s exited reason=%q exitCode=%d attempt=%d", pod.Metadata.UID, observation.ContainerID, observation.ExitReason, observation.ExitCode, observation.Attempt)
 		if !observation.StartedAt.IsZero() && observation.FinishedAt.Sub(observation.StartedAt) >= time.Minute {
 			state.failures = 0
 		}
