@@ -1,0 +1,27 @@
+=== RUN   TestG2
+=== RUN   TestG2/G2-01_scaling
+--- FAIL: TestG2 (6.43s)
+    --- FAIL: TestG2/G2-01_scaling (1.58s)
+panic: interface conversion: interface {} is acceptance.object, not map[string]interface {} [recovered, repanicked]
+
+goroutine 50 [running]:
+testing.tRunner.func1.2({0x7ff744865560, 0x32332969e2d0})
+	C:/Program Files/Go/src/testing/testing.go:1974 +0x239
+testing.tRunner.func1()
+	C:/Program Files/Go/src/testing/testing.go:1977 +0x349
+panic({0x7ff744865560?, 0x32332969e2d0?})
+	C:/Program Files/Go/src/runtime/panic.go:860 +0x13a
+mini-k8s/internal/acceptance.specOf(...)
+	C:/Users/李浩阳/Desktop/mini k8s/internal/acceptance/g1_test.go:118
+mini-k8s/internal/acceptance.(*g2Fixture).createSet(0x323329490280, {0x7ff7448db105, 0x5}, 0x1)
+	C:/Users/李浩阳/Desktop/mini k8s/internal/acceptance/g2_test.go:179 +0x28c
+mini-k8s/internal/acceptance.TestG2.func2(0x3233296a9f48?)
+	C:/Users/李浩阳/Desktop/mini k8s/internal/acceptance/g2_test.go:320 +0x31
+mini-k8s/internal/acceptance.TestG2.TestG2.func1.func8(0x323329698000?)
+	C:/Users/李浩阳/Desktop/mini k8s/internal/acceptance/g2_test.go:315 +0x5e
+testing.tRunner(0x323329698000, 0x323329688000)
+	C:/Program Files/Go/src/testing/testing.go:2036 +0xc3
+created by testing.(*T).Run in goroutine 18
+	C:/Program Files/Go/src/testing/testing.go:2101 +0x4a9
+FAIL	mini-k8s/internal/acceptance	7.375s
+FAIL
