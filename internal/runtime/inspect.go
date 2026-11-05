@@ -179,8 +179,11 @@ func (c *Client) Inspect(ctx context.Context, uid string) (Observation, error) {
 	if err := checkUID(uid); err != nil {
 		return Observation{}, err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	unlock, err := c.lockPod(ctx, uid)
+	if err != nil {
+		return Observation{}, err
+	}
+	defer unlock()
 	state, err := c.snapshot(ctx, uid)
 	if err != nil {
 		return Observation{}, err

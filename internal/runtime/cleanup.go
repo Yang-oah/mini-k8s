@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
 	runtimev1 "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
@@ -13,10 +14,15 @@ func (c *Client) Cleanup(ctx context.Context, uid string) (result error) {
 	if err := checkUID(uid); err != nil {
 		return err
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	unlock, err := c.lockPod(ctx, uid)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	defer func() { slog.Info("CRI cleanup", "podUID", uid, "success", result == nil) }()
+	started := time.Now()
 	state, err := c.snapshot(ctx, uid)
+	logTimedOperation(uid, "snapshot-before-cleanup", started, err)
 	if err != nil {
 		return err
 	}
@@ -28,7 +34,9 @@ func (c *Client) Cleanup(ctx context.Context, uid string) (result error) {
 		return nil
 	}
 	// StopPodSandbox 会停止沙箱内所有容器：有非本项目容器时不能调用。
+	started = time.Now()
 	all, err := c.runtime.ListContainers(ctx, &runtimev1.ListContainersRequest{Filter: &runtimev1.ContainerFilter{PodSandboxId: state.sandboxStatus.Id}})
+	logTimedOperation(uid, "list-sandbox-containers", started, err)
 	if err != nil {
 		return fmt.Errorf("list sandbox containers: %w", err)
 	}
@@ -38,28 +46,34 @@ func (c *Client) Cleanup(ctx context.Context, uid string) (result error) {
 		}
 	}
 	for _, container := range all.Containers {
+		started = time.Now()
 		_, err := c.runtime.StopContainer(ctx, &runtimev1.StopContainerRequest{ContainerId: container.Id, Timeout: 10})
-		logOperation(uid, "stop-container", err)
+		logTimedOperation(uid, "stop-container", started, err)
 		if err != nil {
 			return fmt.Errorf("stop container: %w", err)
 		}
+		started = time.Now()
 		_, err = c.runtime.RemoveContainer(ctx, &runtimev1.RemoveContainerRequest{ContainerId: container.Id})
-		logOperation(uid, "remove-container", err)
+		logTimedOperation(uid, "remove-container", started, err)
 		if err != nil {
 			return fmt.Errorf("remove container: %w", err)
 		}
 	}
+	started = time.Now()
 	_, err = c.runtime.StopPodSandbox(ctx, &runtimev1.StopPodSandboxRequest{PodSandboxId: state.sandboxStatus.Id})
-	logOperation(uid, "stop-sandbox", err)
+	logTimedOperation(uid, "stop-sandbox", started, err)
 	if err != nil {
 		return fmt.Errorf("stop sandbox and release network: %w", err)
 	}
+	started = time.Now()
 	_, err = c.runtime.RemovePodSandbox(ctx, &runtimev1.RemovePodSandboxRequest{PodSandboxId: state.sandboxStatus.Id})
-	logOperation(uid, "remove-sandbox", err)
+	logTimedOperation(uid, "remove-sandbox", started, err)
 	if err != nil {
 		return fmt.Errorf("remove sandbox: %w", err)
 	}
+	started = time.Now()
 	remaining, err := c.snapshot(ctx, uid)
+	logTimedOperation(uid, "snapshot-after-cleanup", started, err)
 	if err != nil {
 		return err
 	}

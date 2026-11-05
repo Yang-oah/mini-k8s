@@ -33,9 +33,9 @@ fi
 
 {
   printf '# G5 readiness evidence collection\n\n'
-  printf -- '- Result: BLOCKED\n- Started (UTC): %s\n- Finished (UTC): %s\n' "$started" "$(date -u +%FT%TZ)"
-  printf -- '- API observation: %s\n- Details: %s\n' "$result" "$reason"
+  printf -- '- Collection: %s\n- Gate: NOT_EVALUATED\n- Started (UTC): %s\n- Finished (UTC): %s\n' "$result" "$started" "$(date -u +%FT%TZ)"
+  printf -- '- Details: %s\n' "$reason"
   printf '\n%s\n' '- This collector does not decide readiness or the G5 gate. See docs/g5-readiness.md.'
 } >"$out/G5-readiness.md"
-printf 'BLOCKED: %s\nEvidence: %s\n' "$reason" "$out"
-exit 2
+printf 'Collection: %s; readiness/G5 gate: NOT_EVALUATED\n%s\nEvidence: %s\n' "$result" "$reason" "$out"
+case "$result" in CAPTURED) exit 0 ;; FAILED) exit 1 ;; *) exit 2 ;; esac

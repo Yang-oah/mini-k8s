@@ -1,6 +1,6 @@
 # Mini K8s 阶段验收 Gateway
 
-状态：验收规范，G1–G5 均为 NOT_RUN。  
+状态：验收规范。第 9 节是当前结论；历史报告不能代替同一最终版本的复验。
 配套计划：[Plan.md](Plan.md)。本文定义 demo 的阶段通过条件，不是一个需要部署的网关服务，也不替代原 PRD 全量 P0 验收。
 
 ## 1. 如何判定合格
@@ -105,13 +105,15 @@ G4-04 后恢复控制连接并确认两节点正常，再执行后续健康场�
 | G5-04 重启/存储恢复 | 依次重启 Agent、manager、API；另行暂停 etcd 10 秒后恢复，每次恢复后再做下一项 | Agent/manager 重启不增加运行实例；API 重启不丢对象；etcd 暂停时写请求在配置的 5 秒请求超时内返回 503，独立业务 TCP 仍可访问；依赖恢复后 30 秒内控制循环收敛 |
 | G5-05 失联与重新就绪 | 断开节点控制连接直至 Unknown，检查健康侧 Proxy；恢复连接，并让其中一个旧容器保持不监听 | Unknown 后 5 秒内健康侧 Proxy 摘端点；恢复后不监听的 Pod 不得因旧 Ready 被加回；重新监听并通过新探测后 10 秒内加入。分区 Proxy 不纳入及时性保证 |
 | G5-06 20 Pod 演示 | 使用 requests=50m/64Mi、limits=100m/128Mi 的 20 个 Pod，发布 RS+Service，访问、伸缩至 4 再至 0 | 发布后 30 秒内全部 Ready；稳定运行 5 分钟，20 次新 Service 连接均成功，无非预期应用重启；每次伸缩 30 秒内实际数量收敛 |
-| G5-07 删除清理 | 删除 RS/Service，检查两节点运行时、网络、预留及项目转发规则 | 30 秒内测试资源清空、预留/IP 回归基线；删除的 Service 规则清除；宿主机无关规则不受影响；日志足以定位本轮关键操作 |
+| G5-07 删除清理 | 删除 RS/Service，检查两节点运行时、网络、预留及项目转发规则 | 30 秒内本轮 Pod、ReplicaSet、Service 对象清空；节点预留和本轮 Pod 的 CNI 租约回到测试前基线；删除的 Service 转发规则清除；宿主机无关规则不受影响；日志足以定位本轮关键操作。已删除 Service 的 ClusterIP 声明不要求回到测试前可用数量 |
+
+**已知限制：** 删除 Service 后，该 ClusterIP 声明永久保留，避免失联 Proxy 把旧规则用到后来复用的地址上。`GET /api/mini/v1/service-pool` 把仍属于当前 Service 的声明标为 `active`，把已删除 Service 的声明标为 `retained`。G5-07 的回归基线只包括本轮 Pod 的 CNI 租约、节点预留和已删除 Service 的转发规则。retained 声明必须单独记录，不能写成已释放。分区期间不保证失联 Proxy 及时摘除端点。
 
 **退出：** G5-01–07 全 PASS，同一最终代码版本关联的 G1–G4 检查也通过，安装/示例/排障说明可照步骤执行，已知限制已登记。可标记“mini demo 验收通过”，不能标记“PRD AC01–AC25 全部通过”。
 
 ## 8. 最轻量的执行方式与报告
 
-实现每个阶段时增加对应 Linux shell 入口，约定如下；当前尚未创建这些脚本，不可当作可用命令执行：
+实现每个阶段时增加对应 Linux shell 入口，约定如下。`g1.sh`、`g2.sh` 和 `g3.sh` 已存在。`g4.sh` 目前只做无副作用预检，结果固定为 BLOCKED，不能当成 G4 PASS。仓库里没有单独的 `g5.sh`；G5 的采集脚本不判定 Gate。
 
 ```text
 scripts/acceptance/g1.sh
@@ -144,8 +146,8 @@ scripts/acceptance/g5.sh
 
 | Gate | 状态 | 原因 |
 | --- | --- | --- |
-| G1 | NOT_RUN | 仓库当前只有文档，尚无实现和脚本 |
-| G2 | NOT_RUN | 同上，且依赖 G1 |
-| G3 | NOT_RUN | 同上，且依赖真实 Linux CRI/CNI 环境 |
-| G4 | NOT_RUN | 同上，且依赖两个 Worker |
-| G5 | NOT_RUN | 同上，且依赖服务转发和整体实现 |
+| G1 | PASS | 2026-11-05T03:13:46Z–03:14:04Z，当前源码 `scripts/acceptance/g1.sh`。源码校验 `4933ed318f8dcdb14c36cdc6d37d6696df4cfc59991b5ae3786198008c2e3fb8`。证据 `artifacts/acceptance/20261105T031346Z-2204431/G1.md`。使用隔离 etcd，没有连接 2379 上的验收集群 |
+| G2 | PASS | 同一源码校验，2026-11-05T03:13:46Z–03:15:03Z，`scripts/acceptance/g2.sh`。证据 `artifacts/acceptance/20261105T031346Z-g2-2203712/G2.md`。这是资源模型对账，不是容器恢复 |
+| G3 | PASS | 2026-11-05T03:57:33Z–04:00:24Z，同一源码校验 `4933ed318f8dcdb14c36cdc6d37d6696df4cfc59991b5ae3786198008c2e3fb8`，`scripts/acceptance/g3.sh`。证据 `artifacts/acceptance/20261105T035733Z-g3-2857150/G3.md`。脚本内先复验的 G1、G2 也通过。验收集群的 node-a Agent 在测试结束后按原 g5b 命令拉起 |
+| G4 | PASS | 2026-11-05T05:39:26Z–05:41:48Z，同一源码校验 `4933ed318f8dcdb14c36cdc6d37d6696df4cfc59991b5ae3786198008c2e3fb8`。证据 `/home/lihaoyang/mini-k8s-g4/evidence/g4cur-20261105T053926Z`。API、manager、scheduler 和两台 Agent 是这次从该源码构建的 `*.g4cur`。G4-01–06 全 PASS；结束时两台 CNI 租约都只剩 `last_reserved_ip.0` 和 `lock`，本项目容器已清空。`g4.sh` 仍只是预检，这次结果来自 `scripts/acceptance/g4-live.ps1`。两台 proxy 没有换成这批二进制 |
+| G5 | 功能检查 PASS；交付说明待完成 | 2026-11-05，源码校验 `4933ed318f8dcdb14c36cdc6d37d6696df4cfc59991b5ae3786198008c2e3fb8`，与上列 G1–G4 一致。G5-01–07 结果及构建记录在控制面 `/home/lihaoyang/mini-k8s-g4/evidence/g5cur-20261105T062559Z/`。G5-07 中 Pod 租约、预留和规则回到基线，但 Service 地址仍为 retained，见上面的已知限制。安装、示例、排障说明的 Worker 侧步骤尚需核对，暂不标记完整 demo 交付通过。 |

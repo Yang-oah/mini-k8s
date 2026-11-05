@@ -61,7 +61,17 @@ func (s *Server) create(ctx context.Context, w http.ResponseWriter, r *http.Requ
 	k := resourceKey(kind, o.meta.Name)
 	var tx *clientv3.TxnResponse
 	var err error
-	if rs, ok := o.value.(*api.ReplicaSet); ok {
+	if _, ok := o.value.(*api.Service); ok {
+		tx, err = s.createService(ctx, k, o)
+	} else if node, ok := o.value.(*api.Node); ok {
+		poolRev, checkErr := s.checkNodeServiceCIDR(ctx, node.Spec.PodCIDR)
+		if checkErr != nil {
+			respondNodeCIDRError(checkErr, respondError)
+			return
+		}
+		// 池配置检查与节点写入之间的池变化必须导致事务失败。
+		tx, err = s.Client.Txn(ctx).If(clientv3.Compare(clientv3.Version(k), "=", 0), clientv3.Compare(clientv3.ModRevision(serviceCIDRKey), "=", poolRev)).Then(clientv3.OpPut(k, encodeObject(o)), clientv3.OpPut(nodeCIDRRevisionKey, o.meta.UID)).Commit()
+	} else if rs, ok := o.value.(*api.ReplicaSet); ok {
 		// 对选择器和标记取一致快照，再在事务中比较标记版本，
 		// 防止并发创建时两个重叠的选择器同时通过检查。
 		marker := prefix + "replicaset-selector-revision"
@@ -98,6 +108,14 @@ func (s *Server) create(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		tx, err = s.Client.Txn(ctx).If(clientv3.Compare(clientv3.Version(k), "=", 0)).Then(clientv3.OpPut(k, encodeObject(o))).Commit()
 	}
 	if err != nil {
+		if errors.Is(err, errServicePoolUnavailable) {
+			respondError(503, "Unavailable", "service address pool is not configured")
+			return
+		}
+		if errors.Is(err, errServicePoolConflict) || errors.Is(err, errServicePoolExhausted) || errors.Is(err, errServiceCIDROverlap) || errors.Is(err, errInvalidNodeNetwork) || errors.Is(err, errServiceConflict) {
+			respondError(409, "Conflict", err.Error())
+			return
+		}
 		if errors.Is(err, errOwnerUnavailable) {
 			respondError(409, "Conflict", "owner ReplicaSet missing or deleting")
 			return
@@ -153,6 +171,7 @@ func (s *Server) update(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		respondError(400, "Invalid", "system metadata is immutable")
 		return
 	}
+	var nodePoolRev int64
 	switch v := next.value.(type) {
 	case *api.Pod:
 		prior := old.value.(*api.Pod)
@@ -187,6 +206,12 @@ func (s *Server) update(ctx context.Context, w http.ResponseWriter, r *http.Requ
 			respondError(403, "Forbidden", "status is a system field")
 			return
 		}
+		var checkErr error
+		nodePoolRev, checkErr = s.checkNodeServiceCIDR(ctx, v.Spec.PodCIDR)
+		if checkErr != nil {
+			respondNodeCIDRError(checkErr, respondError)
+			return
+		}
 	case *api.Service:
 		if v.Spec.ClusterIP != old.value.(*api.Service).Spec.ClusterIP {
 			respondError(403, "Forbidden", "clusterIP is a system field")
@@ -194,9 +219,15 @@ func (s *Server) update(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		}
 	}
 	// 校验后仍需在写入事务中比较版本，防止覆盖并发更新。
+	comparisons := []clientv3.Cmp{clientv3.Compare(clientv3.ModRevision(resourceKey(kind, name)), "=", old.meta.ResourceVersion)}
+	writes := []clientv3.Op{clientv3.OpPut(resourceKey(kind, name), encodeObject(next))}
+	if kind == "nodes" {
+		comparisons = append(comparisons, clientv3.Compare(clientv3.ModRevision(serviceCIDRKey), "=", nodePoolRev))
+		writes = append(writes, clientv3.OpPut(nodeCIDRRevisionKey, next.meta.UID))
+	}
 	cas, err := s.Client.Txn(ctx).
-		If(clientv3.Compare(clientv3.ModRevision(resourceKey(kind, name)), "=", old.meta.ResourceVersion)).
-		Then(clientv3.OpPut(resourceKey(kind, name), encodeObject(next))).
+		If(comparisons...).
+		Then(writes...).
 		Commit()
 	if err != nil {
 		respondError(503, "Unavailable", "storage unavailable")
@@ -244,7 +275,13 @@ func (s *Server) delete(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		}
 		op = clientv3.OpPut(k, encodeObject(old))
 	}
-	res, err := s.Client.Txn(ctx).If(clientv3.Compare(clientv3.ModRevision(k), "=", old.meta.ResourceVersion)).Then(op).Commit()
+	compares := []clientv3.Cmp{clientv3.Compare(clientv3.ModRevision(k), "=", old.meta.ResourceVersion)}
+	if service, ok := old.value.(*api.Service); ok && service.Spec.ClusterIP != "" {
+		// 保留声明，防止失联 Proxy 的旧规则将复用地址转到旧工作负载。
+		// 服务对象和声明的 UID 必须同时匹配，避免删除同名重建的资源。
+		compares = append(compares, clientv3.Compare(clientv3.Value(serviceClaimPrefix+service.Spec.ClusterIP), "=", old.meta.UID))
+	}
+	res, err := s.Client.Txn(ctx).If(compares...).Then(op).Commit()
 	if err != nil {
 		respondError(503, "Unavailable", "storage unavailable")
 		return

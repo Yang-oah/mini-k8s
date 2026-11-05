@@ -80,7 +80,7 @@ export G5_OBSERVE_DURATION=180s G5_OBSERVE_INTERVAL=200ms
 bash scripts/acceptance/g5-readiness.sh
 ```
 
-采样结束输出证据目录和 `BLOCKED` 是预期行为：该脚本本身无法证明整个子模块或 G5 通过。将该目录中的 `api-series.jsonl`、采样错误与以下操作事件一起保存，确认采样贯穿实际变更窗口；不含完整窗口或有采样错误则不能判通过。
+采样结束后脚本输出证据目录、采集状态和 `Gate: NOT_EVALUATED`：它本身无法证明整个子模块或 G5 通过。采集成功退出 0、采集失败退出 1、缺少输入退出 2。将该目录中的 `api-series.jsonl`、采样错误与以下操作事件一起保存，确认采样贯穿实际变更窗口；不含完整窗口或有采样错误则不能判通过。
 
 ## 在同一容器中切换监听
 

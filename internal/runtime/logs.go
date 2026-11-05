@@ -20,8 +20,11 @@ func (c *Client) Logs(ctx context.Context, uid string, tail int) (string, error)
 	if tail < 1 || tail > 10000 {
 		return "", errors.New("tail must be between 1 and 10000")
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	unlock, err := c.lockPod(ctx, uid)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
 	state, err := c.snapshot(ctx, uid)
 	if err != nil {
 		return "", err

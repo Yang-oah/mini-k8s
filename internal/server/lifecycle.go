@@ -176,7 +176,16 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request, kind, name strin
 		return
 	}
 	old, err := decode(get.Kvs[0].Value, kind, get.Kvs[0].ModRevision)
-	if err != nil || !s.agentCanRead(ctx, who, kind, old) {
+	if err != nil {
+		respondError(503, "Unavailable", "invalid stored resource")
+		return
+	}
+	allowed, err := s.agentCanRead(ctx, who, kind, old)
+	if err != nil {
+		respondError(503, "Unavailable", "storage unavailable")
+		return
+	}
+	if !allowed {
 		respondError(403, "Forbidden", "resource not authorized")
 		return
 	}

@@ -1,0 +1,10 @@
+apiVersion: mini.k8s/v1
+kind: Service
+metadata:
+  name: g5-demo
+  namespace: default
+spec:
+  selector:
+    app: g5-demo
+  port: 8080
+  targetPort: 8080
