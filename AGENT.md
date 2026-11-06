@@ -6,21 +6,13 @@
 
 ## 动手前
 
-1. 先读与本次改动对应的阶段文档：G1 看 [docs/g1.md](docs/g1.md)，G2 看 [docs/g2.md](docs/g2.md)，G3 看 [docs/g3.md](docs/g3.md)。
+1. 从 [验收总览](docs/acceptance-overview.md) 找到本次改动涉及的阶段与操作文档。
 2. 再读要改的包，沿现有调用路径改，不另起一套存储、队列或运行时。
 3. 核对 `artifacts/acceptance/` 里最新一份相关报告。历史 PASS 只说明当时的代码版本；改了共用 API、模型或持久化之后，受影响的 Gate 必须重跑。
-4. [Plan.md](Plan.md) 第 6 节仍写着“仓库只有文档”。以当前代码树和验收报告为准，不要按那一句判断实现是否存在。
 
 ## 当前进度
 
-初始化本文件时（2026-11-04）的证据：
-
-- G1：真实 API + etcd 3.5.21 上有 PASS 记录，见 `artifacts/acceptance/20261103-223622-cba45116/G1.md`。
-- G2：真实 API/etcd 上有 PASS 记录，节点状态由测试客户端模拟，见 `artifacts/acceptance/20261103-233533-g2-11908ff0/G2.md`。这不代表容器运行时已通过。
-- G3：已有 Agent、CRI 封装和 `scripts/acceptance/g3.sh`。最近一份完整 G3 报告是 BLOCKED，原因是当时没有 Linux Worker。G3 未 PASS 之前不进入 G4。
-- G4、G5 尚未实施。调度仍不是自动闭环，Service 转发尚未实现。
-
-上面是初始化当时的记录，不要把它当成现在的阶段结论。以后的 Gate 结论以 [Gateway.md](Gateway.md) 第 9 节为准。R1 的实现边界和验证记录以 [docs/r1-reliability-design.md](docs/r1-reliability-design.md) 的状态说明为准；完整 R1 还没有验收通过。
+G1–G5 的阶段结论和受测版本记录在 [Gateway 第 9 节](Gateway.md#9-当前状态)。R1 的实现边界和验证记录见 [R1 详细设计](docs/r1-reliability-design.md)。
 
 ## 代码地图
 
@@ -29,7 +21,9 @@
 | `cmd/mini-api` | 加载身份文件，连接 etcd，启动 HTTPS API。 |
 | `cmd/mini-k8s` | CLI 入口。连接参数放在子命令之前。 |
 | `cmd/mini-manager` | 单实例 Controller。按 owner UID 对账 ReplicaSet。 |
+| `cmd/mini-scheduler` | 根据节点状态和可用资源调度 Pod。 |
 | `cmd/mini-agent` | 本机 Agent。通过 CRI 处理已绑定到本节点的 Pod。 |
+| `cmd/mini-proxy` | 读取 Service 端点并管理本机转发规则。 |
 | `internal/api` | 资源模型、单位和校验。 |
 | `internal/server` | 认证授权、字段归属、etcd 事务、List/Watch。ReplicaSet 子 Pod 的创建意图也写在这里。 |
 | `internal/controller` | 副本决策。不选节点，不访问 CRI。子 Pod 创建走 ReplicaSet 的 create-operation，不直接 POST Pod。 |
@@ -37,7 +31,7 @@
 | `internal/cli` | 严格 YAML 解码和 HTTPS 调用。 |
 | `internal/acceptance` | G1/G2/G3 的真实进程验收。未设置环境变量时跳过，跳过不是通过。 |
 | `scripts/acceptance` | 隔离 etcd、执行检查、记录证据、清理。 |
-| `examples` | G1 的 Pod 和 ReplicaSet 样例。 |
+| `examples` | Pod、ReplicaSet 和 Service 的样例清单。 |
 
 只有 API 访问 etcd。CLI、Controller 和 Agent 都走 HTTPS API。
 
