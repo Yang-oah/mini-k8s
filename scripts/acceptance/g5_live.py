@@ -16,7 +16,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-SRC = "/home/lihaoyang/mini-k8s-g4/evidence/r1-selector-v10-I2MJLyAh"
+SRC = os.environ.get("R1_SOURCE_DIR", "/home/lihaoyang/mini-k8s-g4/evidence/r1-selector-v10-I2MJLyAh")
 HOME = "/home/lihaoyang/mini-k8s-g4"
 BIN = HOME + "/bin"
 LOGS = HOME + "/logs"
@@ -29,7 +29,7 @@ ETCD_ARGV = HOME + "/g5cur-etcd.json"
 ROOT_REQ = HOME + "/g5cur-root-req.json"
 ROOT_ACK = HOME + "/g5cur-root-ack.json"
 ROOT_STOP = HOME + "/g5cur-root.stop"
-EXPECTED = "1a8537f578953716d9c2c9858b2f2421d2ff961c1ea8212b9c3e3991e9e401a8"
+EXPECTED = os.environ.get("R1_EXPECTED_SHA", "1a8537f578953716d9c2c9858b2f2421d2ff961c1ea8212b9c3e3991e9e401a8")
 SERVICE_IMAGE = "docker.io/library/g5-service@sha256:5c28668e30e46b6f74a6ce67eed386d1d00df09ed65a6018166b2e03f26a4236"
 PROBE_IMAGE = "docker.io/library/g4-probe@sha256:80caa5bfcece4648f735b36a8fbeb394a497bfe9390d8a72575dfc934d7a4a42"
 CRICTL = "/usr/local/bin/crictl"
@@ -153,6 +153,8 @@ def source_checksum():
 
 
 def checksum_or_die():
+    if not os.path.isabs(SRC) or ".." in SRC.split("/") or not re.fullmatch(r"/[A-Za-z0-9_./-]+", SRC) or not re.fullmatch(r"[0-9a-f]{64}", EXPECTED):
+        die("源码路径或 SHA-256 参数无效")
     got = source_checksum()
     if got != EXPECTED:
         die("源码校验是 %s，期望 %s" % (got, EXPECTED))

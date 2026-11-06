@@ -7,6 +7,8 @@
 - [产品需求与边界](PRD.md)
 - [分阶段实现计划](Plan.md)
 - [各阶段验收标准](Gateway.md)
+- [可靠性路线图](docs/reliability-roadmap.md)
+- [R1 设计与验收记录](docs/r1-reliability-design.md)
 - [开发与代码阅读指南](docs/development.md)
 - [G2 副本控制器说明](docs/g2.md)
 - [G3 单节点 Agent 说明](docs/g3.md)
