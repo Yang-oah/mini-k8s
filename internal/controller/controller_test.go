@@ -15,21 +15,149 @@ import (
 )
 
 type fakeAPI struct {
-	pods               map[string]api.Pod
-	creates            []string
-	createAttempts     []string
-	deletes            []string
-	finalizes          int
-	dropCreateResponse bool
-	delayCreate        bool
+	pods                map[string]api.Pod
+	creates             []string
+	createAttempts      []string
+	deletes             []string
+	finalizes           int
+	dropCreateResponse  bool
+	delayCreate         bool
+	pending             *createOperation
+	operations          map[int64]createOperation
+	sequence            int64
+	dropPrepareResponse bool
+	dropCancelResponse  bool
+	pendingQueryError   bool
+	replayPrepare       *createOperation
+	podListRevision     int64
+	preparedRevision    int64
 }
 
 func (f *fakeAPI) RoundTrip(r *http.Request) (*http.Response, error) {
 	w := httptest.NewRecorder()
 	path := strings.TrimPrefix(r.URL.Path, prefix)
 	switch {
+	case strings.HasPrefix(path, "replicasets/") && strings.HasSuffix(path, "/create-operation"):
+		if f.operations == nil {
+			f.operations = make(map[int64]createOperation)
+		}
+		switch r.Method {
+		case http.MethodGet:
+			if f.pendingQueryError {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				break
+			}
+			if id := r.URL.Query().Get("operationID"); id != "" {
+				var seq int64
+				if _, err := fmt.Sscan(id, &seq); err != nil {
+					return nil, err
+				}
+				op, ok := f.operations[seq]
+				if !ok {
+					w.WriteHeader(http.StatusNotFound)
+					break
+				}
+				json.NewEncoder(w).Encode(op)
+				break
+			}
+			if f.pending == nil {
+				w.WriteHeader(http.StatusNotFound)
+				break
+			}
+			json.NewEncoder(w).Encode(f.pending)
+		case http.MethodPost:
+			var req struct {
+				UID             string `json:"uid"`
+				PodName         string `json:"podName"`
+				ResourceVersion int64  `json:"resourceVersion"`
+				PodListRevision int64  `json:"podListRevision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				return nil, err
+			}
+			f.preparedRevision = req.PodListRevision
+			if f.replayPrepare != nil {
+				json.NewEncoder(w).Encode(f.replayPrepare)
+				f.replayPrepare = nil
+				break
+			}
+			if f.pending == nil {
+				f.sequence++
+				op := createOperation{UID: req.UID, RSVersion: req.ResourceVersion, OperationID: f.sequence, PodName: req.PodName, State: "PREPARED"}
+				f.pending = &op
+				f.operations[op.OperationID] = op
+			}
+			if f.dropPrepareResponse {
+				f.dropPrepareResponse = false
+				return nil, errors.New("prepare response lost")
+			}
+			json.NewEncoder(w).Encode(f.pending)
+		case http.MethodPut:
+			var req struct {
+				UID         string `json:"uid"`
+				OperationID int64  `json:"operationID"`
+				PodName     string `json:"podName"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				return nil, err
+			}
+			f.createAttempts = append(f.createAttempts, req.PodName)
+			op, ok := f.operations[req.OperationID]
+			if !ok || op.UID != req.UID || op.PodName != req.PodName {
+				w.WriteHeader(http.StatusConflict)
+				break
+			}
+			if op.State == "COMMITTED" {
+				json.NewEncoder(w).Encode(op)
+				break
+			}
+			if op.State != "PREPARED" {
+				w.WriteHeader(http.StatusConflict)
+				break
+			}
+			if f.delayCreate {
+				f.delayCreate = false
+				return nil, errors.New("create outcome unknown")
+			}
+			if _, exists := f.pods[op.PodName]; exists {
+				w.WriteHeader(http.StatusConflict)
+				break
+			}
+			p := api.Pod{Metadata: api.Metadata{Name: op.PodName, UID: "uid-" + op.PodName, OwnerUID: op.UID}}
+			f.pods[op.PodName] = p
+			f.creates = append(f.creates, op.PodName)
+			op.State, op.PodUID = "COMMITTED", p.Metadata.UID
+			f.operations[op.OperationID], f.pending = op, nil
+			if f.dropCreateResponse {
+				f.dropCreateResponse = false
+				return nil, errors.New("response lost after commit")
+			}
+			json.NewEncoder(w).Encode(op)
+		case http.MethodDelete:
+			var req struct {
+				UID         string `json:"uid"`
+				OperationID int64  `json:"operationID"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				return nil, err
+			}
+			op, ok := f.operations[req.OperationID]
+			if !ok || op.UID != req.UID || op.State != "PREPARED" {
+				w.WriteHeader(http.StatusConflict)
+				break
+			}
+			op.State = "CANCELLED"
+			f.operations[op.OperationID], f.pending = op, nil
+			if f.dropCancelResponse {
+				f.dropCancelResponse = false
+				return nil, errors.New("cancel response lost")
+			}
+			json.NewEncoder(w).Encode(op)
+		default:
+			return nil, fmt.Errorf("unexpected operation method %s", r.Method)
+		}
 	case path == "pods" && r.Method == http.MethodGet:
-		list := podList{}
+		list := podList{ResourceVersion: f.podListRevision}
 		for _, pod := range f.pods {
 			list.Items = append(list.Items, pod)
 		}
@@ -124,6 +252,96 @@ func TestUnknownCreateRetriesSameNameAfterAbsentRead(t *testing.T) {
 	}
 	if len(f.pods) != 1 {
 		t.Fatalf("pods = %d, want 1", len(f.pods))
+	}
+}
+
+func TestLostPrepareResponseRecoversPendingAfterRestart(t *testing.T) {
+	f := &fakeAPI{pods: map[string]api.Pod{}, dropPrepareResponse: true}
+	rs := testReplicaSet()
+	if err := testController(f).reconcile(context.Background(), rs); err == nil {
+		t.Fatal("lost prepare response must remain unconfirmed")
+	}
+	if f.pending == nil || len(f.creates) != 0 {
+		t.Fatal("prepared operation was lost or Pod was created")
+	}
+	first := *f.pending
+	// 模拟重启：新控制器没有任何进程内操作状态。
+	if err := testController(f).reconcile(context.Background(), rs); err != nil {
+		t.Fatal(err)
+	}
+	if f.sequence != first.OperationID || len(f.creates) != 1 || f.creates[0] != first.PodName {
+		t.Fatalf("did not recover original operation: sequence=%d creates=%v", f.sequence, f.creates)
+	}
+}
+
+func TestPrepareReplayUsesSnapshotRevisionAndDoesNotCreateAgain(t *testing.T) {
+	rs := testReplicaSet()
+	for _, state := range []string{"COMMITTED", "CANCELLED"} {
+		t.Run(state, func(t *testing.T) {
+			op := &createOperation{UID: rs.Metadata.UID, RSVersion: rs.Metadata.ResourceVersion, OperationID: 7, PodName: "old", State: state}
+			if state == "COMMITTED" {
+				op.PodUID = "old-uid"
+			}
+			f := &fakeAPI{pods: map[string]api.Pod{}, replayPrepare: op, podListRevision: 42}
+			if err := testController(f).reconcile(context.Background(), rs); err != nil {
+				t.Fatal(err)
+			}
+			if f.preparedRevision != 42 || len(f.createAttempts) != 0 {
+				t.Fatalf("snapshot=%d attempted=%v", f.preparedRevision, f.createAttempts)
+			}
+		})
+	}
+}
+
+func TestPendingCreateCancelledBeforeScaleDown(t *testing.T) {
+	f := &fakeAPI{pods: map[string]api.Pod{}, delayCreate: true, dropCancelResponse: true}
+	rs := testReplicaSet()
+	if err := testController(f).reconcile(context.Background(), rs); err == nil {
+		t.Fatal("unconfirmed commit must remain unknown")
+	}
+	rs.Spec.Replicas = 0
+	if err := testController(f).reconcile(context.Background(), rs); err == nil {
+		t.Fatal("lost cancellation response must remain unknown")
+	}
+	if err := testController(f).reconcile(context.Background(), rs); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.creates) != 0 || f.pending != nil || f.operations[1].State != "CANCELLED" {
+		t.Fatalf("unexpected state: creates=%v pending=%v operations=%v", f.creates, f.pending, f.operations)
+	}
+}
+
+func TestChangedReplicaSetVersionCancelsStalePendingBeforeScaleUp(t *testing.T) {
+	f := &fakeAPI{pods: map[string]api.Pod{}, delayCreate: true}
+	rs := testReplicaSet()
+	if err := testController(f).reconcile(context.Background(), rs); err == nil {
+		t.Fatal("unconfirmed commit must remain unknown")
+	}
+	rs.Metadata.ResourceVersion++
+	rs.Spec.Replicas = 2
+	if err := testController(f).reconcile(context.Background(), rs); err != nil {
+		t.Fatal(err)
+	}
+	if f.pending != nil || f.operations[1].State != "CANCELLED" || len(f.creates) != 0 {
+		t.Fatalf("stale operation not cancelled: pending=%v operations=%v creates=%v", f.pending, f.operations, f.creates)
+	}
+	if err := testController(f).reconcile(context.Background(), rs); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.creates) != 1 || f.sequence != 2 {
+		t.Fatalf("fresh reconciliation did not create: %v", f.creates)
+	}
+}
+
+func TestPendingQueryFailureStopsAllChanges(t *testing.T) {
+	rs := testReplicaSet()
+	rs.Spec.Replicas = 0
+	f := &fakeAPI{pods: map[string]api.Pod{"owned": {Metadata: api.Metadata{Name: "owned", UID: "p", OwnerUID: rs.Metadata.UID}}}, pendingQueryError: true}
+	if err := testController(f).reconcile(context.Background(), rs); err == nil {
+		t.Fatal("pending query failure must stop reconciliation")
+	}
+	if len(f.deletes) != 0 || len(f.creates) != 0 || f.finalizes != 0 {
+		t.Fatal("changed resources after pending query failure")
 	}
 }
 

@@ -84,6 +84,36 @@ func testOwnedPod(name, ownerUID string) api.Pod {
 	return api.Pod{APIVersion: api.Version, Kind: "Pod", Metadata: api.Metadata{Name: name, OwnerUID: ownerUID}, Spec: testPodSpec()}
 }
 
+// 创建受 RS 管理的 Pod 必须经过持久化意图；保留旧测试的 201/Pod 响应形态。
+func createOwnedOperation(t *testing.T, s *Server, rs api.ReplicaSet, podName string) *httptest.ResponseRecorder {
+	t.Helper()
+	list := apiRequest(t, s, "controller", http.MethodGet, "pods", nil)
+	if list.Code != http.StatusOK {
+		return list
+	}
+	var snapshot struct {
+		ResourceVersion int64 `json:"resourceVersion"`
+	}
+	if err := json.Unmarshal(list.Body.Bytes(), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	path := "replicasets/" + rs.Metadata.Name + "/create-operation"
+	prepared := apiRequest(t, s, "controller", http.MethodPost, path, map[string]any{"uid": rs.Metadata.UID, "resourceVersion": rs.Metadata.ResourceVersion, "podListRevision": snapshot.ResourceVersion, "podName": podName})
+	if prepared.Code != http.StatusOK {
+		return prepared
+	}
+	op := decodeResponse[replicaOperation](t, prepared)
+	committed := apiRequest(t, s, "controller", http.MethodPut, path, map[string]any{"uid": op.UID, "operationID": op.OperationID, "podName": op.PodName})
+	if committed.Code != http.StatusOK {
+		return committed
+	}
+	result := apiRequest(t, s, "admin", http.MethodGet, "pods/"+op.PodName, nil)
+	if result.Code == http.StatusOK {
+		result.Code = http.StatusCreated
+	}
+	return result
+}
+
 // 故障场景也只尝试清理本次生成的资源名称；清理失败必须显式报告。
 func cleanupResources(t *testing.T, s *Server, podName, rsName, nodeName, ownerUID, nodeUID string) {
 	t.Helper()
@@ -156,7 +186,7 @@ func TestReplicaSetDeletionWaitsForBoundPod(t *testing.T) {
 	requireStatus(t, rsResponse, http.StatusCreated)
 	rs := decodeResponse[api.ReplicaSet](t, rsResponse)
 	ownerUID = rs.Metadata.UID
-	podResponse := apiRequest(t, s, "controller", "POST", "pods", testOwnedPod(podName, rs.Metadata.UID))
+	podResponse := createOwnedOperation(t, s, rs, podName)
 	requireStatus(t, podResponse, http.StatusCreated)
 	pod := decodeResponse[api.Pod](t, podResponse)
 	nodeResponse := apiRequest(t, s, "admin", "POST", "nodes", api.Node{APIVersion: api.Version, Kind: "Node", Metadata: api.Metadata{Name: nodeName}, Spec: api.NodeSpec{PodCIDR: "10.3.0.0/24", Allocatable: api.Resources{CPUMilli: 500, MemoryBytes: 512}}})
@@ -175,7 +205,7 @@ func TestReplicaSetDeletionWaitsForBoundPod(t *testing.T) {
 	if rs.Metadata.DeletionTimestamp == nil {
 		t.Fatal("仍有子 Pod 时 RS 未保留删除标记")
 	}
-	requireStatus(t, apiRequest(t, s, "controller", "POST", "pods", testOwnedPod("late-"+suffix, rs.Metadata.UID)), http.StatusConflict)
+	requireStatus(t, createOwnedOperation(t, s, rs, "late-"+suffix), http.StatusConflict)
 	requireStatus(t, apiRequest(t, s, "controller", "DELETE", "pods/"+podName+"?uid="+pod.Metadata.UID, nil), http.StatusOK)
 	finish := map[string]any{"uid": rs.Metadata.UID, "resourceVersion": rs.Metadata.ResourceVersion}
 	requireStatus(t, apiRequest(t, s, "controller", "POST", "replicasets/"+rsName+"/finalize", finish), http.StatusConflict)
@@ -204,7 +234,7 @@ func TestConcurrentChildCreationAndReplicaSetDeletion(t *testing.T) {
 		go func() {
 			defer workers.Done()
 			<-start
-			createResponse = apiRequest(t, s, "controller", "POST", "pods", testOwnedPod(podName, rs.Metadata.UID))
+			createResponse = createOwnedOperation(t, s, rs, podName)
 		}()
 		go func() {
 			defer workers.Done()

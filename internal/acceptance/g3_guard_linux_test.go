@@ -75,7 +75,7 @@ func g3ProcessRole(exe string, args []string, c g3GuardConfig) (string, error) {
 
 func g3PidfdExited(fd int, timeout time.Duration) (bool, error) {
 	items := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-	count, err := unix.Poll(items, int(timeout.Milliseconds()))
+	count, err := g3PollWithRetry(items, timeout, unix.Poll)
 	if err != nil || count == 0 {
 		return false, err
 	}
@@ -83,6 +83,36 @@ func g3PidfdExited(fd int, timeout time.Duration) (bool, error) {
 		return true, nil
 	}
 	return false, fmt.Errorf("unexpected pidfd poll events: %#x", items[0].Revents)
+}
+
+// poll 可被信号中断；使用同一截止时间重试，不能因 EINTR 延长进程退出等待。
+// 非阻塞检查也要重试，但对连续中断设上限并继续报告身份不确定。
+func g3PollWithRetry(items []unix.PollFd, timeout time.Duration, poll func([]unix.PollFd, int) (int, error)) (int, error) {
+	deadline := time.Now().Add(timeout)
+	interruptions := 0
+	for {
+		waitMillis := 0
+		if timeout > 0 {
+			remaining := time.Until(deadline)
+			if remaining <= 0 && interruptions > 0 {
+				return 0, nil
+			}
+			if remaining > 0 {
+				waitMillis = int((remaining + time.Millisecond - 1) / time.Millisecond)
+			}
+		}
+		for i := range items {
+			items[i].Revents = 0
+		}
+		count, err := poll(items, waitMillis)
+		if !errors.Is(err, unix.EINTR) {
+			return count, err
+		}
+		interruptions++
+		if timeout <= 0 && interruptions >= 16 {
+			return 0, err
+		}
+	}
 }
 
 // pidfd 在读取 /proc 前绑定 PID；校验期间身份不会因 PID 复用而指向另一进程。
@@ -225,5 +255,53 @@ func TestG3GuardIdentity(t *testing.T) {
 				t.Fatalf("got role %q, error %v", role, err)
 			}
 		})
+	}
+}
+
+func TestG3GuardPollRetriesInterruptedCalls(t *testing.T) {
+	items := []unix.PollFd{{Fd: 42, Events: unix.POLLIN}}
+	calls := 0
+	poll := func(fds []unix.PollFd, timeout int) (int, error) {
+		calls++
+		if timeout != 0 {
+			t.Fatalf("nonblocking check waited %dms", timeout)
+		}
+		if calls < 4 {
+			return 0, unix.EINTR
+		}
+		fds[0].Revents = unix.POLLIN
+		return 1, nil
+	}
+	count, err := g3PollWithRetry(items, 0, poll)
+	if err != nil || count != 1 || calls != 4 || items[0].Revents != unix.POLLIN {
+		t.Fatalf("interrupted poll: count=%d calls=%d events=%#x err=%v", count, calls, items[0].Revents, err)
+	}
+
+	calls = 0
+	_, err = g3PollWithRetry(items, 0, func([]unix.PollFd, int) (int, error) {
+		calls++
+		return 0, unix.EINTR
+	})
+	if !errors.Is(err, unix.EINTR) || calls != 16 {
+		t.Fatalf("repeated interruptions must remain uncertain: calls=%d err=%v", calls, err)
+	}
+
+	var waits []int
+	count, err = g3PollWithRetry(items, 20*time.Millisecond, func(_ []unix.PollFd, timeout int) (int, error) {
+		waits = append(waits, timeout)
+		time.Sleep(5 * time.Millisecond)
+		return 0, unix.EINTR
+	})
+	if err != nil || count != 0 || len(waits) == 0 {
+		t.Fatalf("deadline after interruption: count=%d waits=%v err=%v", count, waits, err)
+	}
+	for i := 1; i < len(waits); i++ {
+		if waits[i] > waits[i-1] {
+			t.Fatalf("poll deadline extended after interruption: %v", waits)
+		}
+	}
+	_, err = g3PollWithRetry(items, 0, func([]unix.PollFd, int) (int, error) { return 0, unix.EBADF })
+	if !errors.Is(err, unix.EBADF) {
+		t.Fatalf("unexpected poll error must not be hidden: %v", err)
 	}
 }

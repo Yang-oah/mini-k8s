@@ -1,0 +1,88 @@
+// Copied into internal/acceptance in a private snapshot for R1 verification.
+package acceptance
+
+import (
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+)
+
+// TestR1ProcessFaults exercises the production API and controller binaries.
+// The harness pauses the controller's commit before it reaches the API, after
+// the durable PREPARED operation has been written to the isolated etcd.
+func TestR1ProcessFaults(t *testing.T) {
+	pid, err := strconv.Atoi(os.Getenv("R1_FAULT_ETCD_PID"))
+	if err != nil || pid <= 1 {
+		t.Fatal("R1_FAULT_ETCD_PID must identify the isolated etcd launched by the runner")
+	}
+	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil || !strings.Contains(string(cmdline), "r1-process-faults-isolated") {
+		t.Fatal("refusing to signal an etcd process without the isolated run marker")
+	}
+	g := setupG2(t)
+	f := g.base
+	for _, mode := range []string{"controller-restart", "api-restart", "etcd-pause"} {
+		t.Run(mode, func(t *testing.T) {
+			g.t, f.t = t, t
+			g.proxy.arm("pause")
+			name, uid := g.createSet(mode, 1)
+			select {
+			case <-g.proxy.seen:
+			case <-time.After(15 * time.Second):
+				t.Fatal("controller did not reach the commit barrier")
+			}
+			path := fmt.Sprintf("replicasets/%s/create-operation?uid=%s", name, uid)
+			op := f.call("GET", path, controllerToken, nil, 200)
+			id, ok := op["operationID"].(float64)
+			if !ok || id < 1 || op["state"] != "PREPARED" || len(g.owned(uid)) != 0 {
+				t.Fatalf("expected PREPARED and no Pod before fault: operation=%v", op)
+			}
+			// Stop the real controller while its HTTP call is held in the proxy.
+			g.stopManager()
+			switch mode {
+			case "api-restart":
+				f.stop()
+				f.start()
+			case "etcd-pause":
+				if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
+					t.Fatal(err)
+				}
+				defer syscall.Kill(pid, syscall.SIGCONT)
+				_, status, requestErr := f.request("GET", path, controllerToken, nil)
+				if requestErr == nil && status == 200 {
+					t.Fatal("paused etcd returned a successful operation read")
+				}
+				if err := syscall.Kill(pid, syscall.SIGCONT); err != nil {
+					t.Fatal(err)
+				}
+			}
+			recovered := f.call("GET", path, controllerToken, nil, 200)
+			if recovered["operationID"] != id || recovered["state"] != "PREPARED" {
+				t.Fatalf("prepared identity changed: before=%v after=%v", op, recovered)
+			}
+			close(g.proxy.release)
+			g.startManager()
+			pods := g.waitCount(uid, 1, 30*time.Second)
+			podUID := uidOf(pods[0])
+			history := f.call("GET", path+"&operationID="+strconv.FormatInt(int64(id), 10), controllerToken, nil, 200)
+			if history["operationID"] != id || history["state"] != "COMMITTED" || history["podUID"] != podUID {
+				t.Fatalf("original operation did not commit same Pod: %v", history)
+			}
+			for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+				current := g.owned(uid)
+				if len(current) != 1 || uidOf(current[0]) != podUID {
+					t.Fatal("duplicate or replaced Pod after recovery")
+				}
+			}
+			t.Logf("mode=%s rsUID=%s operationID=%.0f podUID=%s", mode, uid, id, podUID)
+			g.deleteSet(name, uid)
+		})
+		if t.Failed() {
+			return
+		}
+	}
+}

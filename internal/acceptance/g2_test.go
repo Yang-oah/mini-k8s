@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,7 +19,7 @@ import (
 
 const controllerToken = "g2-controller-secret"
 
-// faultProxy 只拦截一次 Controller 的真实 Pod 创建；其余请求原样转发。
+// faultProxy 只拦截一次 Controller 的真实创建操作提交；其余请求原样转发。
 type faultProxy struct {
 	mu      sync.Mutex
 	mode    string
@@ -39,7 +40,7 @@ func (p *faultProxy) arm(mode string) {
 func (p *faultProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mu.Lock()
 	mode, seen, release := "", p.seen, p.release
-	if r.Method == http.MethodPost && r.URL.Path == "/api/mini/v1/pods" && p.mode != "" {
+	if r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/api/mini/v1/replicasets/") && strings.HasSuffix(r.URL.Path, "/create-operation") && p.mode != "" {
 		mode, p.mode = p.mode, ""
 	}
 	p.mu.Unlock()
@@ -55,7 +56,7 @@ func (p *faultProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.proxy.ServeHTTP(w, r)
 		return
 	}
-	// 真正提交后才断开客户端连接；若 API 未返回 201，测试不能通过。
+	// 真正提交后才断开客户端连接；非成功状态不得当成有效故障注入。
 	req := r.Clone(r.Context())
 	req.URL.Scheme, req.URL.Host = p.backend.Scheme, p.backend.Host
 	req.RequestURI = ""
@@ -365,14 +366,14 @@ func TestG2(t *testing.T) {
 		return
 	}
 
-	// G2-04：代理等待真实 API 返回 201 后断开连接，验证丢响应不会多建。
+	// G2-04：代理等待真实 API 提交成功后断开连接，验证丢响应不会多建。
 	if !run("G2-04_lost_response", func(t *testing.T) {
 		g.proxy.arm("drop")
 		name, uid := g.createSet("lost", 1)
 		select {
 		case status := <-g.proxy.seen:
-			if status != 201 {
-				t.Fatalf("intercepted create returned %d, expected committed 201", status)
+			if status != http.StatusOK {
+				t.Fatalf("intercepted create returned %d, expected committed 200", status)
 			}
 		case <-time.After(10 * time.Second):
 			t.Fatal("controller did not issue a Pod create")

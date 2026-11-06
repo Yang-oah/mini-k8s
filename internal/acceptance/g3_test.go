@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -520,7 +522,27 @@ func (g *g3Fixture) cri(args ...string) ([]byte, error) {
 	ctx, cancel := g.operationContext(5 * time.Second)
 	defer cancel()
 	args = append([]string{"--runtime-endpoint", g.criSocket, "--image-endpoint", g.criSocket}, args...)
-	return exec.CommandContext(ctx, "crictl", args...).CombinedOutput()
+	out, err := exec.CommandContext(ctx, "crictl", args...).CombinedOutput()
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return out, fmt.Errorf("crictl deadline: %w", ctx.Err())
+	}
+	return out, err
+}
+
+func TestG3CRIDeadlineIsReported(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("requires a Linux executable")
+	}
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "crictl")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexec /bin/sleep 5\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	g := &g3Fixture{deadline: time.Now().Add(100 * time.Millisecond)}
+	if _, err := g.cri("stop", "test-container"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected distinguishable deadline error, got %v", err)
+	}
 }
 
 // 筛选双标签后才保存证据或操作容器，避免触碰同机其他工作负载。
@@ -665,11 +687,7 @@ func (g *g3Fixture) createAndBind() {
 	createdRS := g.call("POST", "replicasets", admin, rs, 201)
 	g.rsUID = uidOf(createdRS)
 	g.recordIdentities()
-	pod := podManifest(g.podName)
-	pod["spec"] = podspec
-	pod["metadata"].(object)["ownerUID"] = g.rsUID
-	pod["metadata"].(object)["labels"] = object{"app": g.rsName}
-	createdPod := g.call("POST", "pods", g3ControllerToken, pod, 201)
+	createdPod := g.createOwnedPod(g.podName)
 	g.podUID = uidOf(createdPod)
 	g.recordIdentities()
 	// Agent 尚未启动，模拟心跳应紧邻绑定，避免准备工作耗尽节点有效期。
@@ -679,7 +697,22 @@ func (g *g3Fixture) createAndBind() {
 	g.boundAt = time.Now()
 }
 
-// 额外测试 Pod 仍通过正式 API 创建和绑定，不修改节点或 etcd 内部状态。
+// createOwnedPod 使用正式创建操作协议，Agent 手工绑定测试不启动调度器。
+func (g *g3Fixture) createOwnedPod(name string) object {
+	g.t.Helper()
+	rs := g.call("GET", "replicasets/"+g.rsName, admin, nil, 200)
+	pods := g.call("GET", "pods", admin, nil, 200)
+	path := "replicasets/" + g.rsName + "/create-operation"
+	operation := g.call("POST", path, g3ControllerToken, object{"uid": g.rsUID, "resourceVersion": resourceVersionOf(rs), "podName": name, "podListRevision": pods["resourceVersion"]}, 200)
+	committed := g.call("PUT", path, g3ControllerToken, object{"uid": g.rsUID, "operationID": operation["operationID"], "podName": name}, 200)
+	pod := g.call("GET", "pods/"+name, admin, nil, 200)
+	if committed["state"] != "COMMITTED" || committed["podUID"] != uidOf(pod) {
+		g.t.Fatal("created Pod does not match committed operation")
+	}
+	return pod
+}
+
+// 额外运行时测试使用独立 Pod；Controller 已停止，不能影响 RS 对账。
 func (g *g3Fixture) createExtra(name, command string, memory int64) string {
 	g.t.Helper()
 	pod := podManifest(name)
@@ -688,9 +721,8 @@ func (g *g3Fixture) createExtra(name, command string, memory int64) string {
 	spec["command"] = []string{"sh", "-c"}
 	spec["args"] = []string{command}
 	spec["resources"] = object{"requests": object{"cpuMilli": 50, "memoryBytes": 16777216}, "limits": object{"cpuMilli": 100, "memoryBytes": memory}}
-	pod["metadata"].(object)["ownerUID"] = g.rsUID
 	pod["metadata"].(object)["labels"] = object{"app": g.rsName}
-	created := g.call("POST", "pods", g3ControllerToken, pod, 201)
+	created := g.call("POST", "pods", admin, pod, 201)
 	uid := uidOf(created)
 	g.extraPods[name] = uid
 	g.recordIdentities()
@@ -708,8 +740,12 @@ func (g *g3Fixture) deletePod(name, uid string) error {
 		if uidOf(pod) != uid {
 			return fmt.Errorf("refuse to delete %s: UID changed", name)
 		}
-		// Controller 删除由 API 在事务前校验 owner 与 UID，避免同名重建竞态。
-		_, code, err = g.request("DELETE", "pods/"+name+"?uid="+url.QueryEscape(uid), g3ControllerToken, nil)
+		// 独立运行时测试 Pod 使用管理员删除；RS 子 Pod 仍由 Controller 删除。
+		identity := g3ControllerToken
+		if _, independent := g.extraPods[name]; independent {
+			identity = admin
+		}
+		_, code, err = g.request("DELETE", "pods/"+name+"?uid="+url.QueryEscape(uid), identity, nil)
 		if err != nil || (code != 200 && code != 404) {
 			return fmt.Errorf("delete %s: HTTP %d: %v", name, code, err)
 		}
@@ -1017,8 +1053,14 @@ func TestG3(t *testing.T) {
 		deadline = time.Now().Add(30 * time.Second)
 		g.deadline = deadline
 		defer func() { g.deadline = time.Time{} }()
-		if out, err := g.cri("stop", containerID); err != nil {
-			t.Fatalf("stop selected test container: %v: %s", err, out)
+		stopOutput, stopErr := g.cri("stop", containerID)
+		if stopErr != nil {
+			if !errors.Is(stopErr, context.DeadlineExceeded) {
+				t.Fatalf("stop selected test container: %v: %s", stopErr, stopOutput)
+			}
+			// 超时只表示 RPC 的结果未知。停止请求可能已生效；继续观察，
+			// 但仍须在原 30 秒期限内证明旧容器被替换及重启计数增长。
+			t.Logf("stop RPC timed out; awaiting independently verified restart: %v", stopErr)
 		}
 		recovered := false
 		for time.Now().Before(deadline) {
@@ -1040,7 +1082,7 @@ func TestG3(t *testing.T) {
 					}
 				}
 				if e == nil && uidOf(current) == g.podUID && status["phase"] == "Running" && count > beforeCount && reason != "" && running == 1 && newID != containerID && time.Now().Before(deadline) {
-					g.evidence("restart.json", object{"pod": current, "containers": containers})
+					g.evidence("restart.json", object{"pod": current, "containers": containers, "stopTimedOut": errors.Is(stopErr, context.DeadlineExceeded)})
 					recovered = true
 					break
 				}
@@ -1048,7 +1090,7 @@ func TestG3(t *testing.T) {
 			time.Sleep(200 * time.Millisecond)
 		}
 		if !recovered {
-			t.Fatal("same UID did not recover with increased restartCount and exit reason")
+			t.Fatalf("same UID did not recover with increased restartCount and exit reason; stop error: %v; stop output: %s", stopErr, stopOutput)
 		}
 		g.checkWatch(violations)
 		list := g.call("GET", "pods", admin, nil, 200)
@@ -1180,15 +1222,7 @@ func TestG3(t *testing.T) {
 		if reserved["cpuMilli"] != float64(0) || reserved["memoryBytes"] != float64(0) {
 			t.Fatalf("old reservation remains: %v", reserved)
 		}
-		manifest := podManifest(g.podName)
-		spec := manifest["spec"].(object)
-		spec["image"] = g.image
-		spec["command"] = []string{"sh", "-c"}
-		spec["args"] = []string{"echo " + g.marker + "; while true; do sleep 1; done"}
-		spec["resources"] = object{"requests": object{"cpuMilli": 50, "memoryBytes": 67108864}, "limits": object{"cpuMilli": 100, "memoryBytes": 134217728}}
-		manifest["metadata"].(object)["ownerUID"] = g.rsUID
-		manifest["metadata"].(object)["labels"] = object{"app": g.rsName}
-		created := g.call("POST", "pods", g3ControllerToken, manifest, 201)
+		created := g.createOwnedPod(g.podName)
 		g.podUID = uidOf(created)
 		g.recordIdentities()
 		if g.podUID == oldUID {

@@ -1,0 +1,82 @@
+package server
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"sync"
+	"testing"
+
+	"mini-k8s/internal/api"
+)
+
+// Both contenders use the same durable operation identity and start together.
+// Run only against an isolated etcd via G2_ETCD_ENDPOINT.
+func TestR1AcceptanceCommitCancelRace(t *testing.T) {
+	for round := 0; round < 20; round++ {
+		t.Run(fmt.Sprintf("round-%02d", round), func(t *testing.T) {
+			s, rs, path := operationTestFixture(t, 1)
+			podName := "race-operation-" + newUID()[:12]
+			prepare := map[string]any{
+				"uid": rs.Metadata.UID, "resourceVersion": rs.Metadata.ResourceVersion,
+				"podListRevision": operationPodRevision(t, s), "podName": podName,
+			}
+			prepared := apiRequest(t, s, "controller", http.MethodPost, path, prepare)
+			requireStatus(t, prepared, http.StatusOK)
+			op := decodeResponse[replicaOperation](t, prepared)
+			if op.State != "PREPARED" {
+				t.Fatalf("expected PREPARED, got %q", op.State)
+			}
+			commit := map[string]any{"uid": op.UID, "operationID": op.OperationID, "podName": op.PodName}
+			cancel := map[string]any{"uid": op.UID, "operationID": op.OperationID}
+			start := make(chan struct{})
+			var group sync.WaitGroup
+			var committed, cancelled *httptest.ResponseRecorder
+			group.Add(2)
+			go func() {
+				defer group.Done()
+				<-start
+				committed = apiRequest(t, s, "controller", http.MethodPut, path, commit)
+			}()
+			go func() {
+				defer group.Done()
+				<-start
+				cancelled = apiRequest(t, s, "controller", http.MethodDelete, path, cancel)
+			}()
+			close(start)
+			group.Wait()
+			query := path + "?uid=" + op.UID + "&operationID=" + strconv.FormatInt(op.OperationID, 10)
+			result := apiRequest(t, s, "controller", http.MethodGet, query, nil)
+			requireStatus(t, result, http.StatusOK)
+			final := decodeResponse[replicaOperation](t, result)
+			list := apiRequest(t, s, "admin", http.MethodGet, "pods", nil)
+			requireStatus(t, list, http.StatusOK)
+			var podList struct {
+				Items []api.Pod `json:"items"`
+			}
+			if err := json.Unmarshal(list.Body.Bytes(), &podList); err != nil {
+				t.Fatal(err)
+			}
+			var owned []api.Pod
+			for _, pod := range podList.Items {
+				if pod.Metadata.OwnerUID == rs.Metadata.UID {
+					owned = append(owned, pod)
+				}
+			}
+			switch final.State {
+			case "COMMITTED":
+				if committed.Code != http.StatusOK || cancelled.Code != http.StatusConflict || len(owned) != 1 || final.PodUID == "" || owned[0].Metadata.UID != final.PodUID || owned[0].Metadata.Name != podName {
+					t.Fatalf("invalid commit result: PUT=%d DELETE=%d operation=%+v owned=%+v", committed.Code, cancelled.Code, final, owned)
+				}
+			case "CANCELLED":
+				if committed.Code != http.StatusConflict || cancelled.Code != http.StatusOK || len(owned) != 0 || final.PodUID != "" {
+					t.Fatalf("invalid cancel result: PUT=%d DELETE=%d operation=%+v owned=%+v", committed.Code, cancelled.Code, final, owned)
+				}
+			default:
+				t.Fatalf("unexpected final state %q: PUT=%d DELETE=%d", final.State, committed.Code, cancelled.Code)
+			}
+		})
+	}
+}

@@ -1,0 +1,30 @@
+=== RUN   TestG1
+=== RUN   TestG1/G1-01_CRUD
+=== RUN   TestG1/G1-02_persistence
+=== RUN   TestG1/G1-03_CAS_fields
+=== RUN   TestG1/G1-04_list_watch
+=== RUN   TestG1/G1-05_binding
+=== RUN   TestG1/G1-06_auth_log
+--- PASS: TestG1 (2.95s)
+    --- PASS: TestG1/G1-01_CRUD (0.84s)
+    --- PASS: TestG1/G1-02_persistence (0.45s)
+    --- PASS: TestG1/G1-03_CAS_fields (0.06s)
+    --- PASS: TestG1/G1-04_list_watch (0.17s)
+    --- PASS: TestG1/G1-05_binding (0.10s)
+    --- PASS: TestG1/G1-06_auth_log (0.01s)
+=== RUN   TestG2
+=== RUN   TestG2/G2-01_scaling
+=== RUN   TestG2/G2-02_restart
+=== RUN   TestG2/G2-03_ownership
+=== RUN   TestG2/G2-04_lost_response
+=== RUN   TestG2/G2-05_delete_race
+=== RUN   TestG2/G2-06_unconfirmed_stop
+--- PASS: TestG2 (51.94s)
+    --- PASS: TestG2/G2-01_scaling (1.45s)
+    --- PASS: TestG2/G2-02_restart (30.66s)
+    --- PASS: TestG2/G2-03_ownership (0.24s)
+    --- PASS: TestG2/G2-04_lost_response (3.20s)
+    --- PASS: TestG2/G2-05_delete_race (10.57s)
+    --- PASS: TestG2/G2-06_unconfirmed_stop (4.65s)
+PASS
+ok  	mini-k8s/internal/acceptance	55.512s

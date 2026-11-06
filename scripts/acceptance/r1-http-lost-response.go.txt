@@ -1,0 +1,160 @@
+// Copied into internal/server in an isolated source snapshot for R1 acceptance.
+package server
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"testing"
+	"time"
+
+	"mini-k8s/internal/api"
+)
+
+// TestR1HTTPCommitResponseLost uses real TCP connections and a real etcd.
+// The proxy observes a complete successful API response before closing the
+// client connection without forwarding it, so the client cannot infer failure.
+func TestR1HTTPCommitResponseLost(t *testing.T) {
+	s, rs, path := operationTestFixture(t, 1)
+	prepare := map[string]any{
+		"uid": rs.Metadata.UID, "resourceVersion": rs.Metadata.ResourceVersion,
+		"podListRevision": operationPodRevision(t, s), "podName": "r1-lost-" + newUID()[:12],
+	}
+	first := apiRequest(t, s, "controller", http.MethodPost, path, prepare)
+	requireStatus(t, first, http.StatusOK)
+	op := decodeResponse[replicaOperation](t, first)
+	commit, err := json.Marshal(map[string]any{"uid": op.UID, "operationID": op.OperationID, "podName": op.PodName})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	upstream := httptest.NewServer(s)
+	defer upstream.Close()
+	type upstreamResult struct {
+		status int
+		body   []byte
+		err    error
+	}
+	observed := make(chan upstreamResult, 1)
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		request, err := http.NewRequestWithContext(r.Context(), r.Method, upstream.URL+r.URL.RequestURI(), r.Body)
+		if err != nil {
+			observed <- upstreamResult{err: err}
+			return
+		}
+		request.Header = r.Header.Clone()
+		response, err := http.DefaultTransport.RoundTrip(request)
+		if err != nil {
+			observed <- upstreamResult{err: err}
+			return
+		}
+		body, readErr := io.ReadAll(response.Body)
+		response.Body.Close()
+		observed <- upstreamResult{status: response.StatusCode, body: body, err: readErr}
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	defer proxy.Close()
+	client := &http.Client{Timeout: 10 * time.Second}
+	request, err := http.NewRequest(http.MethodPut, proxy.URL+"/api/mini/v1/"+path, bytes.NewReader(commit))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer controller")
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(request)
+	if response != nil {
+		response.Body.Close()
+	}
+	if err == nil {
+		t.Fatal("client unexpectedly received a response")
+	}
+	var result upstreamResult
+	select {
+	case result = <-observed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("proxy did not observe an upstream response")
+	}
+	if result.err != nil || result.status != http.StatusOK {
+		t.Fatalf("upstream commit not confirmed: status=%d error=%v body=%s", result.status, result.err, result.body)
+	}
+	var committed replicaOperation
+	if err := json.Unmarshal(result.body, &committed); err != nil {
+		t.Fatal(err)
+	}
+	if committed.State != "COMMITTED" || committed.OperationID != op.OperationID || committed.PodUID == "" {
+		t.Fatalf("invalid upstream commit result: %+v", committed)
+	}
+
+	query := fmt.Sprintf("%s/api/mini/v1/%s?uid=%s&operationID=%s", upstream.URL, path, op.UID, strconv.FormatInt(op.OperationID, 10))
+	get, err := http.NewRequest(http.MethodGet, query, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	get.Header.Set("Authorization", "Bearer controller")
+	response, err = client.Do(get)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("recover query returned %d", response.StatusCode)
+	}
+	var recovered replicaOperation
+	if err := json.NewDecoder(response.Body).Decode(&recovered); err != nil {
+		t.Fatal(err)
+	}
+	if recovered.State != "COMMITTED" || recovered.OperationID != op.OperationID || recovered.PodUID != committed.PodUID {
+		t.Fatalf("recovered operation differs: committed=%+v recovered=%+v", committed, recovered)
+	}
+	// Replaying the exact request over TCP must return the same historical UID.
+	retry, err := http.NewRequest(http.MethodPut, upstream.URL+"/api/mini/v1/"+path, bytes.NewReader(commit))
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry.Header.Set("Authorization", "Bearer controller")
+	retry.Header.Set("Content-Type", "application/json")
+	response, err = client.Do(retry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var replay replicaOperation
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("retry returned %d", response.StatusCode)
+	}
+	if err := json.NewDecoder(response.Body).Decode(&replay); err != nil {
+		t.Fatal(err)
+	}
+	if replay.PodUID != committed.PodUID || replay.OperationID != op.OperationID {
+		t.Fatalf("retry changed identity: %+v", replay)
+	}
+
+	pods := apiRequest(t, s, "admin", http.MethodGet, "pods", nil)
+	requireStatus(t, pods, http.StatusOK)
+	var list struct {
+		Items []api.Pod `json:"items"`
+	}
+	if err := json.Unmarshal(pods.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	count := 0
+	for _, pod := range list.Items {
+		if pod.Metadata.OwnerUID == rs.Metadata.UID {
+			count++
+			if pod.Metadata.UID != committed.PodUID {
+				t.Fatalf("unexpected Pod UID %s", pod.Metadata.UID)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("owner has %d Pods, want 1", count)
+	}
+	t.Logf("confirmed lost response and same-identity recovery: rsUID=%s operationID=%d podUID=%s ownerPodCount=%d", rs.Metadata.UID, op.OperationID, committed.PodUID, count)
+}

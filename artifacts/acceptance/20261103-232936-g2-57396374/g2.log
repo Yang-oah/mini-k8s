@@ -1,0 +1,16 @@
+=== RUN   TestG2
+=== RUN   TestG2/G2-01_scaling
+=== RUN   TestG2/G2-02_restart
+=== RUN   TestG2/G2-03_ownership
+=== RUN   TestG2/G2-04_lost_response
+=== RUN   TestG2/G2-05_delete_race
+    g2_test.go:403: GET replicasets/g1-rs-18e492d44ee39b78-race: got HTTP 404 (<nil>), want 200: {"code":404,"reason":"NotFound","message":"resource not found","requestId":"aeb10795f70be370186a077dcc5951fb"}
+--- FAIL: TestG2 (45.28s)
+    --- PASS: TestG2/G2-01_scaling (2.19s)
+    --- PASS: TestG2/G2-02_restart (31.26s)
+    --- PASS: TestG2/G2-03_ownership (0.54s)
+    --- PASS: TestG2/G2-04_lost_response (4.10s)
+    --- FAIL: TestG2/G2-05_delete_race (0.13s)
+FAIL
+FAIL	mini-k8s/internal/acceptance	46.305s
+FAIL
