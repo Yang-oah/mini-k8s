@@ -10,11 +10,13 @@ import subprocess
 import sys
 import threading
 import time
+import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-SRC = "/home/lihaoyang/mini-k8s-g5final"
+SRC = "/home/lihaoyang/mini-k8s-g4/evidence/r1-selector-v10-I2MJLyAh"
 HOME = "/home/lihaoyang/mini-k8s-g4"
 BIN = HOME + "/bin"
 LOGS = HOME + "/logs"
@@ -22,7 +24,7 @@ EV_PTR = HOME + "/g4cur-evidence.path"
 REQ = HOME + "/g4cur-request.json"
 ACK = HOME + "/g4cur-ack.json"
 FWD_FLAG = HOME + "/g4cur-forwarder-down"
-EXPECTED = "4933ed318f8dcdb14c36cdc6d37d6696df4cfc59991b5ae3786198008c2e3fb8"
+EXPECTED = "1a8537f578953716d9c2c9858b2f2421d2ff961c1ea8212b9c3e3991e9e401a8"
 BUSYBOX = "docker.io/library/busybox@sha256:5b3a16922a16714dac5c393ed0807e516e9f2b7b3d0602baef6b8e38a46aaf88"
 PROBE_IMAGE = "docker.io/library/g4-probe@sha256:80caa5bfcece4648f735b36a8fbeb394a497bfe9390d8a72575dfc934d7a4a42"
 CRICTL = "/usr/local/bin/crictl"
@@ -216,68 +218,66 @@ def mini(*args, timeout=20):
     return proc.stdout
 
 
-def apply_text(text, delete=False):
-    path = os.path.join(ev(), "next.yaml")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
-    mini("delete" if delete else "apply", "-f", path)
+def remember_created(resource, name, uid):
+    if not uid:
+        die("创建响应没有 UID，停止清理 " + name)
+    path = os.path.join(ev(), "created-uids.json")
+    ledger = read_json("created-uids.json") if os.path.exists(path) else {}
+    key = resource + "/" + name
+    if key in ledger and ledger[key] != uid:
+        die("本轮名称对应多个 UID，停止清理 " + key)
+    ledger[key] = uid
+    write_json("created-uids.json", ledger)
+
+
+def apply_text(text):
+    # 测试对象必须 POST 创建；不能用 apply 覆盖并接管同名对象。
+    obj = json.loads(text)
+    resource = {"Pod": "pods", "ReplicaSet": "replicasets"}[obj["kind"]]
+    server, _ca, _path, token, ctx = api()
+    request = urllib.request.Request(server + "/api/mini/v1/" + resource,
+        data=json.dumps(obj).encode(), headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(request, context=ctx, timeout=10) as response:
+        created = json.load(response)
+    remember_created(resource, created["metadata"]["name"], created["metadata"]["uid"])
 
 
 def pod_yaml(name, image, command, cpu, mem, limit_cpu=None, limit_mem=None, labels=None):
     limit_cpu = cpu if limit_cpu is None else limit_cpu
     limit_mem = mem if limit_mem is None else limit_mem
-    lines = ["apiVersion: mini.k8s/v1", "kind: Pod", "metadata:", "  name: " + name]
-    if labels:
-        lines.append("  labels:")
-        for key, value in labels.items():
-            lines.append("    %s: %s" % (key, value))
-    lines += [
-        "spec:",
-        "  image: " + image,
-        "  restartPolicy: Always",
-        "  command: [%s]" % ", ".join(json.dumps(part) for part in command),
-        "  resources:",
-        "    requests:",
-        "      cpuMilli: %d" % cpu,
-        "      memoryBytes: %d" % mem,
-        "    limits:",
-        "      cpuMilli: %d" % limit_cpu,
-        "      memoryBytes: %d" % limit_mem,
-        "",
-    ]
-    return "\n".join(lines)
+    return json.dumps({"apiVersion": "mini.k8s/v1", "kind": "Pod",
+        "metadata": {"name": name, "labels": labels or {}},
+        "spec": {"image": image, "restartPolicy": "Always", "command": command,
+            "resources": {"requests": {"cpuMilli": cpu, "memoryBytes": mem},
+                          "limits": {"cpuMilli": limit_cpu, "memoryBytes": limit_mem}}}})
 
 
 def rs_yaml(name, replicas, image, command, cpu, mem, limit_cpu=None, limit_mem=None):
-    body = pod_yaml("ignored", image, command, cpu, mem, limit_cpu, limit_mem)
-    lines = body.splitlines()
-    spec_body = lines[lines.index("spec:") + 1:]
-    # pod spec 自身缩进 2 格；放进 template.spec 后再加 4 格。
-    indented = "\n".join("    " + line for line in spec_body if line.strip())
-    return "\n".join([
-        "apiVersion: mini.k8s/v1",
-        "kind: ReplicaSet",
-        "metadata:",
-        "  name: " + name,
-        "spec:",
-        "  replicas: %d" % replicas,
-        "  selector:",
-        "    app: " + name,
-        "  template:",
-        "    labels:",
-        "      app: " + name,
-        "    spec:",
-        indented,
-        "",
-    ])
+    pod = json.loads(pod_yaml("ignored", image, command, cpu, mem, limit_cpu, limit_mem))
+    return json.dumps({"apiVersion": "mini.k8s/v1", "kind": "ReplicaSet", "metadata": {"name": name},
+        "spec": {"replicas": replicas, "selector": {"app": name},
+                 "template": {"labels": {"app": name}, "spec": pod["spec"]}}})
 
 
 def delete_names(kind, names):
-    docs = []
+    resource = {"Pod": "pods", "ReplicaSet": "replicasets"}.get(kind)
+    if resource is None:
+        die("拒绝删除未知资源类型 " + kind)
+    server, _ca, _path, token, ctx = api()
+    current = {item["metadata"]["name"]: item for item in (api_get(resource).get("items") or [])}
     for name in names:
-        docs.append("apiVersion: mini.k8s/v1\nkind: %s\nmetadata:\n  name: %s\n" % (kind, name))
-    if docs:
-        apply_text("\n---\n".join(docs), delete=True)
+        item = current.get(name)
+        if item is None:
+            continue
+        uid = item["metadata"].get("uid")
+        ledger = read_json("created-uids.json")
+        if not name.startswith("g4cur-") or not uid or ledger.get(resource + "/" + name) != uid:
+            die("拒绝删除不属于本轮创建 UID 的对象 " + name)
+        # 服务端以 UID 比较，防止读取后同名重建被删除。
+        url = server + "/api/mini/v1/" + resource + "/" + urllib.parse.quote(name, safe="") + "?uid=" + urllib.parse.quote(uid, safe="")
+        request = urllib.request.Request(url, headers={"Authorization": "Bearer " + token}, method="DELETE")
+        with urllib.request.urlopen(request, context=ctx, timeout=10) as response:
+            response.read()
 
 
 def owned(rs_uid):
@@ -424,6 +424,29 @@ def reload_root():
     die("重新读取证书后，节点没有在 40 秒内回到 Ready")
 
 
+def readonly_precheck():
+    """拒绝在已存在业务对象或未恢复故障时改动组件。"""
+    checksum_or_die()
+    assert_certs()
+    for stale in (FWD_FLAG, REQ, ACK):
+        if os.path.exists(stale):
+            die("存在上一轮残留文件，请先检查现场: " + stale)
+    for resource in ("pods", "replicasets", "services"):
+        items = api_get(resource).get("items") or []
+        if items:
+            die("集群存在 %s，拒绝开始测试" % resource)
+    table = nodes()
+    if set(table) != {"node-a", "node-b"}:
+        die("节点不是 node-a 和 node-b")
+    for name, node in table.items():
+        if not node.get("status", {}).get("ready") or reserved(node) != (0, 0):
+            die(name + " 尚未 Ready 或资源预留非零")
+    for role in ROLES:
+        one(role)
+    guard_snapshot()
+    say("只读预检通过：源码、证书、空资源与节点状态已核对")
+
+
 def precheck():
     os.umask(0o077)
     if shutil.which("go") is None:
@@ -437,11 +460,13 @@ def precheck():
         f.write(path + "\n")
     for stale in (REQ, ACK, FWD_FLAG):
         if os.path.exists(stale):
-            os.remove(stale)
+            die("存在上一轮残留文件，请先检查现场: " + stale)
     table = nodes()
     problems = []
-    if pods():
-        problems.append("已有 Pod: " + " ".join(pod["metadata"]["name"] for pod in pods()))
+    for resource in ("pods", "replicasets", "services"):
+        items = api_get(resource).get("items") or []
+        if items:
+            problems.append("已有 " + resource + ": " + " ".join(item["metadata"]["name"] for item in items))
     if set(table) != {"node-a", "node-b"}:
         problems.append("节点不是 node-a 和 node-b")
     for name, node in table.items():
@@ -495,13 +520,25 @@ def build():
         "g4-probe": "./cmd/g4-probe",
     }
     hashes = {}
-    for name, pkg in targets.items():
-        dest = BIN + "/" + name + ".g4cur"
-        say("编译 " + name)
-        proc = subprocess.run(["go", "build", "-o", dest, pkg], cwd=SRC, capture_output=True, text=True)
-        if proc.returncode != 0:
-            die(name + " 编译失败: " + (proc.stderr or "")[-800:])
-        hashes[name] = hashlib.sha256(open(dest, "rb").read()).hexdigest()
+    # 先在同一文件系统内构建，再原子发布；已运行的可执行文件不可就地截断。
+    with tempfile.TemporaryDirectory(prefix=".g4-build-", dir=BIN) as stage:
+        for name, pkg in targets.items():
+            dest = os.path.join(stage, name + ".g4cur")
+            say("编译 " + name)
+            proc = subprocess.run(["go", "build", "-o", dest, pkg], cwd=SRC, capture_output=True, text=True)
+            if proc.returncode != 0:
+                die(name + " 编译失败: " + (proc.stderr or "")[-800:])
+            with open(dest, "rb") as binary:
+                hashes[name] = hashlib.sha256(binary.read()).hexdigest()
+        checksum_or_die()
+        backup = os.path.join(ev(), "previous-binaries")
+        os.mkdir(backup, 0o700)
+        for name in targets:
+            dest = os.path.join(BIN, name + ".g4cur")
+            if os.path.isfile(dest):
+                shutil.copy2(dest, os.path.join(backup, name + ".g4cur"))
+        for name in targets:
+            os.replace(os.path.join(stage, name + ".g4cur"), os.path.join(BIN, name + ".g4cur"))
     write_json("build.json", {"ok": True, "sha256": hashes, "at": now_iso()})
     say("六个程序已写入 bin/*.g4cur")
 
@@ -622,6 +659,7 @@ def ask_b(action, data=None, timeout=180):
                 if not ack.get("ok"):
                     die("node-b %s 失败: %s" % (action, str(ack.get("output", ""))[-500:]))
                 text = ack.get("output") or ""
+                os.remove(ACK)
                 for line in text.splitlines():
                     if line.startswith("G4RESULT "):
                         return json.loads(line[len("G4RESULT "):])
@@ -858,6 +896,10 @@ def concurrent(prefix, count, cpu, mem):
         for line in f:
             if line.strip():
                 creates.append(json.loads(line))
+    # 只记录服务端返回成功及 UID 的本轮请求；未知结果留待人工检查。
+    for item in creates:
+        if item.get("http") == 201 and item.get("uid"):
+            remember_created("pods", item["name"], item["uid"])
     return proc.returncode, creates, samples, started
 
 
@@ -1015,8 +1057,8 @@ def scenario_04():
         "fill": cri_state("node-a", fill["metadata"]["uid"], True),
         "hold": ask_b("cri-present", {"uid": hold["metadata"]["uid"]}),
     }
-    if not before["fill"]["running"] or not before["hold"].get("running"):
-        record("G4-04", False, "切断前没有看到两侧容器")
+    if any(not state.get("running") or not state.get("containers") or not state.get("sandboxes") for state in before.values()):
+        record("G4-04", False, "切断前没有看到两侧运行容器和 sandbox")
     write_json("g404-before.json", {"fill": compact_pod(fill, nodes()), "hold": compact_pod(hold, nodes()), "cri": before})
     samples = []
     stop = {"value": False}
@@ -1077,7 +1119,8 @@ def scenario_04():
     stop["value"] = True
     thread.join(timeout=3)
     after_node = node_of(after, nodes()) if after else ""
-    ok = 18 <= delta <= 20 and after_node == "node-a" and not hold_bad
+    # Gateway 只规定 20 秒上限，不要求 Unknown 最早出现时间。
+    ok = 0 <= delta <= 20 and after_node == "node-a" and not hold_bad
     write_json("g404-window.json", {"delta": delta, "heartbeat": heartbeat, "unknownAt": unknown_at, "afterNode": after_node, "holdBad": hold_bad})
     ask_b("start-forwarder")
     if os.path.exists(FWD_FLAG):
@@ -1092,13 +1135,20 @@ def scenario_04():
         record("G4-04", False, "转发恢复后 30 秒内两台没有都 Ready")
     after_cri = cri_state("node-a", fill["metadata"]["uid"], True)
     hold_cri = ask_b("cri-present", {"uid": hold["metadata"]["uid"]})
-    same = before["fill"]["containers"] == after_cri["containers"] and before["hold"].get("containers") == hold_cri.get("containers")
+    after_states = {"fill": after_cri, "hold": hold_cri}
+    write_json("g404-after.json", {"at": now_iso(), "cri": after_states})
+    same = all(
+        after_states[side].get("running")
+        and before[side]["containers"] == after_states[side].get("containers")
+        and before[side]["sandboxes"] == after_states[side].get("sandboxes")
+        for side in ("fill", "hold")
+    )
     if not ok or not same:
-        record("G4-04", False, "Unknown 延迟 %.2f 秒，after 在 %s，hold 被替换=%s，容器保持=%s" % (delta, after_node or "未运行", hold_bad, same))
+        record("G4-04", False, "Unknown 延迟 %.2f 秒，after 在 %s，hold 被替换=%s，容器和 sandbox 身份保持=%s" % (delta, after_node or "未运行", hold_bad, same))
     delete_names("Pod", ["g4cur-fill", "g4cur-after"])
     delete_names("ReplicaSet", ["g4cur-hold"])
     quiet(70)
-    record("G4-04", True, "最后心跳后 %.2f 秒 Unknown，新 Pod 在 node-a，原 hold 容器保持，连接已恢复" % delta)
+    record("G4-04", True, "最后心跳后 %.2f 秒 Unknown，新 Pod 在 node-a，两侧容器和 sandbox 身份保持，连接已恢复" % delta)
 
 
 def stop_forwarder():
@@ -1282,7 +1332,11 @@ def finish():
     assert_guard(read_json("guard.json"))
     say("")
     say("G4 结果")
-    all_ok = True
+    required = {"G4-%02d" % number for number in range(1, 7)}
+    actual = [row["id"] for row in rows]
+    all_ok = len(actual) == len(required) and set(actual) == required
+    if not all_ok:
+        say("验收记录不完整或包含重复项：" + ", ".join(actual))
     for row in rows:
         say("%s  %s  %s" % (row["id"], "PASS" if row["ok"] else "FAIL", row["detail"]))
         all_ok = all_ok and row["ok"]
@@ -1337,9 +1391,11 @@ def driver():
         say("165 上的检查已完成。接下来还要在 125 上核对租约。")
     except SystemExit:
         recover_forwarder()
+        say("验收中断：组件不会自动回滚。请保留证据并检查当前进程和 previous-binaries: " + ev())
         raise
     except Exception as err:
         recover_forwarder()
+        say("验收中断：组件不会自动回滚。请保留证据并检查当前进程和 previous-binaries: " + ev())
         die(str(err))
 
 
@@ -1354,6 +1410,7 @@ def main():
         die("missing command")
     cmd = sys.argv[1]
     actions = {
+        "readonly-precheck": readonly_precheck,
         "precheck": precheck,
         "reload-root": reload_root,
         "precheck-b": precheck_b,

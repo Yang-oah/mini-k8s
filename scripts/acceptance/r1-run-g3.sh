@@ -3,8 +3,8 @@ set -uo pipefail
 
 # R1 当前快照的 G3 交互式入口；实际断言与清理仍由 g3.sh 执行。
 # 可通过环境变量覆盖测试机相关参数，但源码必须匹配已验证的 R1 快照。
-source_dir="${R1_SOURCE_DIR:-/home/lihaoyang/mini-k8s-g4/evidence/r1-integration-v8-jzrGGUC4}"
-expected_sha="d9744f89f899b8bd3debfaa9cd3113b213103d4b7d415a4ba183d44f159f9d27"
+source_dir="${R1_SOURCE_DIR:-/home/lihaoyang/mini-k8s-g4/evidence/r1-selector-v10-I2MJLyAh}"
+expected_sha="1a8537f578953716d9c2c9858b2f2421d2ff961c1ea8212b9c3e3991e9e401a8"
 image="${G3_TEST_IMAGE:-docker.io/library/busybox@sha256:5b3a16922a16714dac5c393ed0807e516e9f2b7b3d0602baef6b8e38a46aaf88}"
 pod_cidr="${G3_POD_CIDR:-10.88.0.0/24}"
 cni_network="${G3_CNI_NETWORK:-mini-k8s}"

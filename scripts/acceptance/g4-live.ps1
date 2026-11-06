@@ -1,4 +1,4 @@
-# One command for same-version G4-01 through G4-06.
+﻿# One command for same-version G4-01 through G4-06.
 # Run from Windows. It connects to both workers because they cannot SSH to each other.
 # Usage:
 #   pwsh -File ".\scripts\acceptance\g4-live.ps1"
@@ -14,6 +14,9 @@ $RemotePy = "/home/lihaoyang/mini-k8s-g4/g4_live.py"
 $Agent = "/home/lihaoyang/mini-k8s-g4/bin/mini-agent.g4cur"
 $Pointer = "/home/lihaoyang/mini-k8s-g4/g4cur-evidence.path"
 $FwdFlag = "/home/lihaoyang/mini-k8s-g4/g4cur-forwarder-down"
+$RunLock = "/home/lihaoyang/mini-k8s-g4/.r1-live.lock"
+$LockOwned = $false
+$Completed = $false
 $LocalPy = Join-Path $PSScriptRoot "g4_live.py"
 $Watcher = $null
 
@@ -83,9 +86,16 @@ if (-not (Test-Path $KeyA) -or -not (Test-Path $KeyB)) {
 }
 
 try {
+    # 与 G5 共用同一把锁，避免脚本文件、请求通道和故障注入互相覆盖。
+    Invoke-Node $IpA $KeyA "mkdir -- $RunLock"
+    $LockOwned = $true
     Write-Host "上传验收程序"
     Copy-Between $KeyA $LocalPy "${IpA}:$RemotePy"
     Copy-Between $KeyB $LocalPy "${IpB}:$RemotePy"
+
+    Write-Host "先检查两台机器、源码和集群状态"
+    Invoke-Node $IpA $KeyA "python3 -u $RemotePy readonly-precheck"
+    Invoke-Node $IpB $KeyB "python3 -u $RemotePy precheck-b"
 
     Write-Host ""
     Write-Host "第 1 次 sudo：10.128.176.165。只让 root 身份的 Agent 和 proxy 读取新证书，不跑场景。"
@@ -173,10 +183,12 @@ try {
     Copy-Between $KeyB "${IpB}:/tmp/g4cur-final-b.json" $Final
     Copy-Between $KeyA $Final "${IpA}:$Evidence/final-b.json"
     Invoke-Node $IpA $KeyA "python3 -u $RemotePy finish"
+    $Completed = $true
     Write-Host ""
     Write-Host "跑完了。把上面的 G4-01 到 G4-06 结果发回来。这还不是 G5 通过。"
 }
 finally {
+    if ($LockOwned) {
     $flag = ""
     try {
         $flag = (& ssh -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpA "if test -f $FwdFlag; then echo DOWN; fi" | Out-String)
@@ -196,5 +208,12 @@ finally {
             & ssh -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpA "python3 -u $RemotePy report"
         }
     } catch {
+    }
+    if ($Completed) {
+        & ssh -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpA "if test ! -e $FwdFlag; then rmdir -- $RunLock; else exit 1; fi"
+        if ($LASTEXITCODE -ne 0) { Write-Host "恢复状态未确认，运行锁已保留，请检查现场。" }
+    } else {
+        Write-Host "验收未正常结束，运行锁已保留；确认故障标记、组件和测试资源后再人工处理。"
+    }
     }
 }

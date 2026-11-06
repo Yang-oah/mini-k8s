@@ -12,6 +12,18 @@
 
 **G3 当前结果：** 源码摘要 `d9744f89f899b8bd3debfaa9cd3113b213103d4b7d415a4ba183d44f159f9d27` 的 G3-01～05、进程守护和隔离资源清理均通过，且同轮前置 G1/G2 通过。证据位于 `/home/lihaoyang/mini-k8s-g4/evidence/r1-integration-v8-jzrGGUC4/artifacts/acceptance/20261105T155315Z-g3-1178950/`。同版本 G4/G5 尚未复验；回收自动化和旧数据迁移仍未实现。
 
+**更新后的验证：** 源码摘要 `4d6bcb2b61e61797a9329a67a389df46176922debce847c02ca7a7e60a222f5a` 的隔离 G1/G2 通过，证据位于 `/home/lihaoyang/mini-k8s-g4/evidence/r1-integration-v9-lTK16nB5/artifacts/acceptance/20261106T014605Z-g2-1397784/`；真实 etcd 下相关 Server 并发与回收测试以 race 模式连续运行三轮通过。同一快照的 G3-01～05 和清理通过，证据位于 `/home/lihaoyang/mini-k8s-g4/evidence/r1-integration-v9-lTK16nB5/artifacts/acceptance/20261106T015037Z-g3-1491037/`；G4-01～06 及两节点清理通过，证据位于 `/home/lihaoyang/mini-k8s-g4/evidence/g4cur-20261106T024952Z/`。G5-01～07 同版本回归通过，证据位于 `/home/lihaoyang/mini-k8s-g4/evidence/g5cur-20261106T032331Z/`；两侧租约、运行时和规则回到基线，地址 `10.96.0.15` 的声明仍为 retained。R1 专项完整验收尚未结束。
+
+**R1 故障专项增量：** 在上述快照的隔离副本中添加验收测试，使用独立 etcd 与 Go race 检测，通过 20 轮提交与取消竞争，以及真实本地 HTTP 中提交成功后丢弃响应、按原操作身份恢复的测试。证据位于 `/home/lihaoyang/mini-k8s-g4/evidence/r1-integration-v9-lTK16nB5/r1-faults-f2ol7Xj0/`，其中记录了原始快照与测试文件摘要。这组测试本身不覆盖真实进程重启或 etcd 中断。
+
+**R1 PREPARED 恢复验证：** 真实独立 API、Controller 与隔离 etcd 中，将同一 RS 创建操作停在 PREPARED，再分别重启 Controller、重启 API、暂停并恢复 etcd。每项恢复后均使用原 operationID 提交，且只观察到一个相同 UID 的 Pod；证据位于 `/home/lihaoyang/mini-k8s-g4/evidence/r1-integration-v9-lTK16nB5/r1-process-faults-XAVJgPca/`。API 重启和 etcd 暂停期间 Controller 停止，因而不代表 Controller 在存储故障期间持续重试或所有未知结果场景均已验证。
+
+**当前版本隔离容量采样：** 证据位于 `/home/lihaoyang/mini-k8s-g4/evidence/r1-integration-v9-lTK16nB5/r1-capacity-current-6pi0bjmc/`。单机隔离 API/etcd、零副本 RS 的首次并发创建出现 selector 修订竞争：20 个对象、1/8/32 并发首次 201 分别为 20/14/7 个；40 个对象分别为 40/20/10 个，其余返回 409。后续串行重试仅用于补齐读取样本，不改变首次失败统计。这不是吞吐保证，也不能代表双节点 Worker、Pod 收敛或持续负载结果；应在 R2 针对共享 selector 栅栏竞争评估改进。
+
+**selector 竞争修复及回归：** 快照 `1a8537f578953716d9c2c9858b2f2421d2ff961c1ea8212b9c3e3991e9e401a8` 保留 selector 快照和 etcd CAS，遇到无关并发修改时在请求期限内有界退避重试。真实 etcd 和两个 Server 实例的并发/重叠/同名/取消测试以 race 模式重复五轮通过，证据为 `/home/lihaoyang/mini-k8s-g4/evidence/r1-selector-v10-I2MJLyAh/selector-race.log`。同环境的六档容量复测中，20/40 个不同 selector 在 1/8/32 并发下首次均返回 201；40 个对象、32 并发的成功写入 P95 为 1367.241ms。采样为单机零副本 RS，不能视为持续负载或容量承诺，证据目录 `/home/lihaoyang/mini-k8s-g4/evidence/r1-selector-v10-I2MJLyAh/r1-capacity-current-ozhondhu/`。同一新快照的 G1/G2、R1 竞争和进程故障专项通过；G3-01～05、进程身份及清理通过，证据目录 `/home/lihaoyang/mini-k8s-g4/evidence/r1-selector-v10-I2MJLyAh/artifacts/acceptance/20261106T063748Z-g3-4055336/`。G5 回归结果见下。
+
+同一快照的 G4-01～06 与两节点清理通过；证据位于 `/home/lihaoyang/mini-k8s-g4/evidence/g4cur-20261106T065127Z/`。G5-01～07 同版本回归及两节点清理通过，证据位于 `/home/lihaoyang/mini-k8s-g4/evidence/g5cur-20261106T070124Z/`；`10.96.0.18` 的 Service 地址声明仍为 retained。
+
 ## 1. 目标与边界
 
 在单个活跃 Controller Manager、单控制面、单成员 etcd 的部署约束下，先测量容量基线，再确保 ReplicaSet 补建在并发调用、API 响应丢失和进程重启时不会因重复请求额外创建 Pod。etcd 是唯一持久化事实源，仅 API Server 直接访问。对每次创建给出成功、确定未创建或结果未知；未知时保守等待与对账，不换一个操作继续创建。
@@ -79,7 +91,7 @@ R1 只改 Controller 管理的 RS 子 Pod 创建路径和相关容量观测。�
 
 当前实现提供管理员接口 `POST /api/mini/v1/replicasets/<名称>/create-operation-gc`，请求体为 `{"uid":"<RS UID>","operationID":<序号>}`。首次观察终态时启动进程内单调计时并返回 409；经过完整观察窗口后重复调用，每次最多清理 16 个别名，响应 `complete=false` 表示尚需重试，`complete=true` 表示已完成。重启 API 会重新开始观察。不得通过手工删除 etcd 键绕过保留或配额检查；恢复快照后应先重启 API，再观察完整窗口。接口仅支持显式指定身份，尚无自动发现操作和定时回收。
 
-全部操作记录回收后，可由管理员调用 `POST /api/mini/v1/replicasets/<名称>/create-operation-owner-gc`，请求体为 `{"uid":"<旧 RS UID>"}`。服务端核对该 UID 已无 RS、Pod、未决操作及历史记录后，原子回收该 UID 的元数据并释放预算；同名新 RS 使用独立 UID。检查超出 64 个 RS 或 Pod 时返回冲突，需要后续分页扫描能力；不得跳过检查强行删除。
+全部操作记录回收后，可由管理员调用 `POST /api/mini/v1/replicasets/<名称>/create-operation-owner-gc`，请求体为 `{"uid":"<旧 RS UID>"}`。服务端核对该 UID 已无 RS、Pod、未决操作及历史记录后，原子回收该 UID 的元数据并释放预算；同名新 RS 使用独立 UID。检查使用固定的 etcd revision 分页，每页最多 32 个对象，两类对象共用 2048 个的扫描预算；超出预算或快照不可用时保守拒绝，不得跳过检查强行删除。
 
 - `PREPARED` 不因普通 TTL 自动删除；不可确认的操作保持待核实并告警。对可确定取消的意图先完成 CAS 终态化。
 - `COMMITTED` 至少保留到关联 Pod 已回收且超过保留窗口；`CANCELLED` 至少保留到相同窗口结束。当前代码把这个窗口定为 24 小时加 10 秒，并把单个 RS UID 的操作键用量上限定为 10000、全局上限定为 100000。这两个上限是拒绝新意图的实现阈值，不是压测得到的容量。
@@ -104,6 +116,17 @@ R1 只改 Controller 管理的 RS 子 Pod 创建路径和相关容量观测。�
 | R1-C | Controller 恢复、回收和过期处理 | 分别注入准备响应丢失、提交成功但响应丢失、提交与取消竞争、进程/API 重启、etcd 暂停；恢复后不重复创建。测试 Pod 删除后旧结果重试、RS 同名新 UID、记录清理后的旧序号、容量上限。 |
 
 针对每轮保存源码与构建身份、操作 ID/RS UID/Pod UID、注入和恢复的时间、请求/响应、etcd/API 观察结果、最终 Pod 清单和清理结果。组件重启或 etcd 故障时，既有运行容器应维持原身份；验证结束只清理由该次测试创建、可确认 UID 的资源。针对变更影响运行必要的 G1/G2、调度及 G5 回归；回归范围由具体 diff 确定。
+
+### 当前一次性验收清单
+
+以源码摘要 `1a8537f578953716d9c2c9858b2f2421d2ff961c1ea8212b9c3e3991e9e401a8` 为准：
+
+- **既有功能回归：通过。** G1～G5 同版本结果及证据见本文开头。G5 的双节点 20 Pod 发布和伸缩也是有效的收敛证据，不因单独的 API 基线采样没有 Worker 而失效。
+- **R1-B 与 R1-C：已有覆盖。** 真实 etcd 下并发提交、同 ID 重放与冲突、提交与取消竞争及回收测试通过；响应丢失、重启及存储恢复测试的具体环境与范围见开头记录。真实进程的 PREPARED 故障测试在 API 重启和 etcd 暂停期间停止了 Controller，不能作为 Controller 在故障期间持续运行的证明；准备响应丢失由模拟 API 验证。
+- **R1-A：基线已补采，存在指标缺口。** 当前版本的 20/40 个零副本 RS、1/8/32 客户端六档均完成；首次创建均为 201，读取均为 200。原始 etcd 指标、Watch 数、进程 CPU/内存、磁盘采样与资源限制记录保存在 `/home/lihaoyang/mini-k8s-g4/evidence/r1-selector-v10-I2MJLyAh/r1-capacity-current-xh5jxzts/`。本轮没有 Watch 负载，Watcher 仅为瞬时值；etcd 未暴露 `grpc_server_handling_seconds` 请求耗时直方图，因此不能声称已获得 etcd 请求延迟分布。规划没有指定持续压测分钟数或最低吞吐门槛，不因此新增硬性通过条件。
+- **设计限制：持续保留。** 当前是单 Controller、单成员 etcd；操作记录回收需管理员显式调用，旧 schema 暂无迁移工具；缓存与全局并发控制在后续阶段。记录数／磁盘独立告警尚未确认实现，当前仅确认配额耗尽返回 503。上述限制不因 G1～G5 通过而消失，不能将其描述为已经实现。
+
+**集中评测记录：** 复核上述源码摘要后，使用独立 etcd 重跑 Server/Controller race 测试通过（Service 地址测试因独占空 etcd 的前提而单独重跑通过）；提交与取消竞争、真实 HTTP 响应丢失及 PREPARED 进程故障测试通过。证据分别位于 `r1-selector-v10-I2MJLyAh/r1-evaluation-IUIbvU8z/`、`r1-selector-v10-I2MJLyAh/r1-service-evaluation-43Bad37b/`、`r1-selector-v10-I2MJLyAh/r1-faults-ZzzfksO8/` 和 `r1-selector-v10-I2MJLyAh/r1-process-faults-2aE6I6Ul/`，均相对于 `/home/lihaoyang/mini-k8s-g4/evidence/`。详细设计提及记录数和磁盘告警，路线图将磁盘水位告警列入 R4；当前代码仅确认配额耗尽返回 503，普通错误日志不能当作独立告警。
 
 ## 9. 已知风险与尚未关闭的决定
 

@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import ssl
@@ -11,10 +12,11 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-SRC = "/home/lihaoyang/mini-k8s-g5final"
+SRC = "/home/lihaoyang/mini-k8s-g4/evidence/r1-selector-v10-I2MJLyAh"
 HOME = "/home/lihaoyang/mini-k8s-g4"
 BIN = HOME + "/bin"
 LOGS = HOME + "/logs"
@@ -27,13 +29,14 @@ ETCD_ARGV = HOME + "/g5cur-etcd.json"
 ROOT_REQ = HOME + "/g5cur-root-req.json"
 ROOT_ACK = HOME + "/g5cur-root-ack.json"
 ROOT_STOP = HOME + "/g5cur-root.stop"
-EXPECTED = "4933ed318f8dcdb14c36cdc6d37d6696df4cfc59991b5ae3786198008c2e3fb8"
+EXPECTED = "1a8537f578953716d9c2c9858b2f2421d2ff961c1ea8212b9c3e3991e9e401a8"
 SERVICE_IMAGE = "docker.io/library/g5-service@sha256:5c28668e30e46b6f74a6ce67eed386d1d00df09ed65a6018166b2e03f26a4236"
 PROBE_IMAGE = "docker.io/library/g4-probe@sha256:80caa5bfcece4648f735b36a8fbeb394a497bfe9390d8a72575dfc934d7a4a42"
 CRICTL = "/usr/local/bin/crictl"
 FWD = HOME + "/g4-tcp-forward.py"
-FIXTURE = BIN + "/g5-service-fixture.g4cur"
-PROXY_BIN = BIN + "/mini-proxy.g4cur"
+FIXTURE = BIN + "/g5-service-fixture.g5cur"
+PROXY_BIN = BIN + "/mini-proxy.g5cur"
+PROXY_RECOVERY = HOME + "/.r1-g5-proxy-recovery"
 ENDPOINTS = {
     "node-a": "unix:///run/containerd/containerd.sock",
     "node-b": "unix:///run/mini-k8s/containerd.sock",
@@ -156,6 +159,43 @@ def checksum_or_die():
     return got
 
 
+def process_digest(role):
+    """Hash the executable actually mapped by the process, not argv[0]."""
+    _role, pid, _argv = one(role)
+    digest = hashlib.sha256()
+    with open("/proc/%d/exe" % pid, "rb") as executable:
+        for chunk in iter(lambda: executable.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {"pid": pid, "sha256": digest.hexdigest()}
+
+
+def g4_manifest():
+    with open(HOME + "/g4cur-evidence.path", encoding="utf-8") as handle:
+        directory = handle.read().strip()
+    def load(name):
+        with open(os.path.join(directory, name), encoding="utf-8") as handle:
+            return json.load(handle)
+    check, build, results = load("precheck.json"), load("build.json"), load("results.json")
+    baseline_b, final_b = load("baseline-b.json")["report"], load("final-b.json")["report"]
+    expected_ids = {"G4-%02d" % number for number in range(1, 7)}
+    if check.get("checksum") != EXPECTED or not check.get("ok") or not build.get("ok"):
+        die("G4 证据不属于当前源码，或构建没有通过")
+    if len(results) != len(expected_ids) or {row.get("id") for row in results} != expected_ids or not all(row.get("ok") for row in results):
+        die("G4 必须包含六项通过记录")
+    if final_b["leases"] != baseline_b["leases"] or final_b["containers"] or final_b["sandboxes"]:
+        die("G4 node-b 的清理尚未回到基线")
+    return {"directory": directory, "sha256": build["sha256"]}
+
+
+def verify_processes(expected, roles):
+    observed = {}
+    for role in roles:
+        observed[role] = process_digest(role)
+        if observed[role]["sha256"] != expected.get(role):
+            die(role + " 的实际运行二进制与构建摘要不一致")
+    return observed
+
+
 def flag_map(argv):
     out = {}
     items = argv[1:]
@@ -234,88 +274,76 @@ def nodes():
 
 def mini(*args, timeout=30):
     server, ca, token_path, _token, _ctx = api()
-    cmd = [BIN + "/mini-k8s.g4cur", "--server", server, "--ca-file", ca, "--token-file", token_path, *args]
+    cmd = [BIN + "/mini-k8s.g5cur", "--server", server, "--ca-file", ca, "--token-file", token_path, *args]
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if proc.returncode != 0:
         raise RuntimeError((proc.stderr or proc.stdout or "cli failed")[:500])
     return proc.stdout
 
 
-def apply_text(text, delete=False):
-    path = os.path.join(ev(), "next.yaml")
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(text)
-    mini("delete" if delete else "apply", "-f", path)
+def apply_text(text):
+    # 创建响应中的 UID 是本轮唯一所有权凭证；绝不覆盖同名对象。
+    obj = json.loads(text)
+    resource = {"Pod": "pods", "ReplicaSet": "replicasets", "Service": "services"}[obj["kind"]]
+    server, _ca, _path, token, ctx = api()
+    request = urllib.request.Request(server + "/api/mini/v1/" + resource,
+        data=json.dumps(obj).encode(), headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(request, context=ctx, timeout=10) as response:
+        created = json.load(response)
+    uid, name = created["metadata"].get("uid"), created["metadata"]["name"]
+    if not uid:
+        die("创建响应没有 UID，不能安全清理 " + name)
+    ledger_path = os.path.join(ev(), "created-uids.json")
+    ledger = read_json("created-uids.json") if os.path.exists(ledger_path) else {}
+    key = resource + "/" + name
+    if key in ledger and ledger[key] != uid:
+        die("本轮名称对应多个 UID，停止清理 " + key)
+    ledger[key] = uid
+    write_json("created-uids.json", ledger)
 
 
 def pod_yaml(name, image, command, cpu, mem, limit_cpu, limit_mem, labels, readiness=None):
-    lines = ["apiVersion: mini.k8s/v1", "kind: Pod", "metadata:", "  name: " + name, "  namespace: default", "  labels:"]
-    for key, value in labels.items():
-        lines.append("    %s: %s" % (key, value))
-    lines += [
-        "spec:",
-        "  image: " + image,
-        "  restartPolicy: Always",
-        "  command: [%s]" % ", ".join(json.dumps(part) for part in command),
-    ]
+    spec = {"image": image, "restartPolicy": "Always", "command": command,
+            "resources": {"requests": {"cpuMilli": cpu, "memoryBytes": mem},
+                          "limits": {"cpuMilli": limit_cpu, "memoryBytes": limit_mem}}}
     if readiness:
-        lines += ["  readiness:", "    port: %d" % readiness]
-    lines += [
-        "  resources:",
-        "    requests:",
-        "      cpuMilli: %d" % cpu,
-        "      memoryBytes: %d" % mem,
-        "    limits:",
-        "      cpuMilli: %d" % limit_cpu,
-        "      memoryBytes: %d" % limit_mem,
-        "",
-    ]
-    return "\n".join(lines)
+        spec["readiness"] = {"port": readiness}
+    return json.dumps({"apiVersion": "mini.k8s/v1", "kind": "Pod",
+        "metadata": {"name": name, "namespace": "default", "labels": labels}, "spec": spec})
 
 
 def service_yaml(name, selector, port, target):
-    lines = [
-        "apiVersion: mini.k8s/v1",
-        "kind: Service",
-        "metadata:",
-        "  name: " + name,
-        "  namespace: default",
-        "spec:",
-        "  selector:",
-    ]
-    for key, value in selector.items():
-        lines.append("    %s: %s" % (key, value))
-    lines += ["  port: %d" % port, "  targetPort: %d" % target, ""]
-    return "\n".join(lines)
+    return json.dumps({"apiVersion": "mini.k8s/v1", "kind": "Service",
+        "metadata": {"name": name, "namespace": "default"},
+        "spec": {"selector": selector, "port": port, "targetPort": target}})
 
 
 def rs_yaml(name, replicas, image, command, cpu, mem, limit_cpu, limit_mem):
-    body = pod_yaml("ignored", image, command, cpu, mem, limit_cpu, limit_mem, {"app": name}, 8080)
-    spec_body = body.splitlines()[body.splitlines().index("spec:") + 1:]
-    indented = "\n".join("    " + line for line in spec_body if line.strip())
-    return "\n".join([
-        "apiVersion: mini.k8s/v1",
-        "kind: ReplicaSet",
-        "metadata:",
-        "  name: " + name,
-        "  namespace: default",
-        "spec:",
-        "  replicas: %d" % replicas,
-        "  selector:",
-        "    app: " + name,
-        "  template:",
-        "    labels:",
-        "      app: " + name,
-        "    spec:",
-        indented,
-        "",
-    ])
+    pod = json.loads(pod_yaml("ignored", image, command, cpu, mem, limit_cpu, limit_mem, {"app": name}, 8080))
+    return json.dumps({"apiVersion": "mini.k8s/v1", "kind": "ReplicaSet",
+        "metadata": {"name": name, "namespace": "default"},
+        "spec": {"replicas": replicas, "selector": {"app": name},
+                 "template": {"labels": {"app": name}, "spec": pod["spec"]}}})
 
 
 def delete_names(kind, names):
-    docs = ["apiVersion: mini.k8s/v1\nkind: %s\nmetadata:\n  name: %s\n  namespace: default\n" % (kind, name) for name in names]
-    if docs:
-        apply_text("\n---\n".join(docs), delete=True)
+    resource = {"Pod": "pods", "ReplicaSet": "replicasets", "Service": "services"}[kind]
+    server, _ca, _path, token, ctx = api()
+    current = {item["metadata"]["name"]: item for item in (api_get(resource).get("items") or [])}
+    ledger = read_json("created-uids.json")
+    for name in names:
+        item = current.get(name)
+        if item is None:
+            continue
+        uid = item["metadata"].get("uid")
+        if not name.startswith("g5cur-") and name != "g5cur":
+            die("拒绝删除测试前缀之外的对象 " + name)
+        if not uid or ledger.get(resource + "/" + name) != uid:
+            die("拒绝删除不属于本轮创建 UID 的对象 " + name)
+        url = server + "/api/mini/v1/" + resource + "/" + urllib.parse.quote(name, safe="") + "?uid=" + urllib.parse.quote(uid, safe="")
+        request = urllib.request.Request(url, headers={"Authorization": "Bearer " + token}, method="DELETE")
+        with urllib.request.urlopen(request, context=ctx, timeout=10) as response:
+            response.read()
 
 
 def node_of(pod, table):
@@ -532,7 +560,8 @@ def rule_hits(ips, use_sudo=False):
             matched.append(line)
             for ip in found:
                 hits[ip] += 1
-    return hits, matched
+    normalized = "\n".join(re.sub(r"\[\d+:\d+\]", "[0:0]", line) for line in text.splitlines() if not line.startswith("#"))
+    return hits, matched, normalized
 
 
 def lease_names(node, use_sudo=False):
@@ -553,9 +582,9 @@ def cri_ids(node, use_sudo=False):
 
 
 def local_snapshot(node, ips, use_sudo=False):
-    hits, matched = rule_hits(ips, use_sudo)
+    hits, matched, ruleset = rule_hits(ips, use_sudo)
     containers, sandboxes = cri_ids(node, use_sudo)
-    return {"leases": lease_names(node, use_sudo), "containers": containers, "sandboxes": sandboxes, "rules": hits, "matched": matched}
+    return {"leases": lease_names(node, use_sudo), "containers": containers, "sandboxes": sandboxes, "rules": hits, "matched": matched, "iptables": ruleset}
 
 
 def container_id(node, uid, use_sudo):
@@ -607,7 +636,16 @@ def precheck():
         die("非交互 PATH 里没有 go")
     assert_certs()
     got = checksum_or_die()
+    manifest = g4_manifest()
+    control = verify_processes(manifest["sha256"], ("mini-api", "mini-manager", "mini-scheduler"))
     problems = []
+    if os.path.exists(FWD_FLAG) or os.path.exists(ETCD_FLAG) or os.path.exists(PROXY_RECOVERY):
+        problems.append("上轮故障恢复标记仍在，须先检查现场")
+    for pending in (REQ, ACK, ROOT_REQ, ROOT_ACK):
+        if os.path.exists(pending):
+            problems.append("上轮请求或应答未清理: " + pending)
+    if any(item[0] == "root-helper" for item in procs()):
+        problems.append("已有取证进程运行")
     if pods():
         problems.append("已有 Pod")
     if replicasets():
@@ -622,19 +660,19 @@ def precheck():
         status = node.get("status") or {}
         if status.get("condition") != "Ready" or not status.get("ready") or cpu or mem:
             problems.append(name + " 不是空闲 Ready")
-    if os.path.basename(one("mini-api")[2][0]) != "mini-api.g4cur":
-        problems.append("API 不是 g4cur")
-    if os.path.basename(one("mini-agent")[2][0]) != "mini-agent.g4cur":
-        problems.append("node-a Agent 不是 g4cur")
+    if problems:
+        die("；".join(problems))
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = HOME + "/evidence/g5cur-" + stamp
     os.makedirs(path, 0o700)
     with open(EV_PTR, "w", encoding="utf-8") as handle:
         handle.write(path + "\n")
-    for stale in (REQ, ACK, FWD_FLAG, ETCD_FLAG, ROOT_REQ, ROOT_ACK, ROOT_STOP):
+    for stale in (ROOT_STOP,):
         if os.path.exists(stale):
             os.remove(stale)
     write_json("precheck.json", {"ok": not problems, "checksum": got, "problems": problems, "at": now_iso()})
+    write_json("g4-manifest.json", manifest)
+    write_json("control-identities.json", control)
     if problems:
         die("；".join(problems))
     say("源码校验通过，集群是空的。证据目录 " + path)
@@ -645,7 +683,7 @@ def build():
     os.makedirs(BIN, exist_ok=True)
     hashes = {}
     for name, pkg in (("mini-proxy", "./cmd/mini-proxy"), ("g5-service-fixture", "./cmd/g5-service-fixture"), ("mini-k8s", "./cmd/mini-k8s")):
-        dest = BIN + "/" + name + ".g4cur"
+        dest = BIN + "/" + name + ".g5cur"
         tmp = dest + ".new"
         say("编译 " + name)
         proc = subprocess.run(["go", "build", "-o", tmp, pkg], cwd=SRC, capture_output=True, text=True)
@@ -655,7 +693,58 @@ def build():
         os.replace(tmp, dest)
         hashes[name] = hashlib.sha256(open(dest, "rb").read()).hexdigest()
     write_json("build.json", {"ok": True, "sha256": hashes, "at": now_iso()})
-    say("proxy、fixture 和 CLI 已写入 bin/*.g4cur")
+    say("proxy、fixture 和 CLI 已写入 bin/*.g5cur")
+
+
+def rollback_proxy():
+    """Only stop the proxy installed by this run; retain backup for inspection."""
+    state_path = os.path.join(PROXY_RECOVERY, "state.json")
+    if not os.path.exists(state_path):
+        if os.path.exists(PROXY_RECOVERY):
+            die("proxy 回滚目录不完整，请人工检查 " + PROXY_RECOVERY)
+        say("没有需要恢复的 proxy")
+        return
+    with open(state_path, encoding="utf-8") as handle:
+        state = json.load(handle)
+    backup = os.path.join(PROXY_RECOVERY, "mini-proxy.saved")
+    with open(backup, "rb") as binary:
+        if hashlib.sha256(binary.read()).hexdigest() != state["old_sha256"]:
+            die("proxy 回滚文件校验失败；保留现场")
+    current = [item for item in procs() if item[0] == "mini-proxy"]
+    if len(current) > 1:
+        die("proxy 数量异常，拒绝自动回滚")
+    if current:
+        actual = process_digest("mini-proxy")["sha256"]
+        if actual == state["old_sha256"]:
+            say("原 proxy 已在运行")
+            return
+        if actual != state["new_sha256"]:
+            die("当前 proxy 身份不属于本轮，拒绝停止")
+        stop_pid(current[0][1])
+    argv = state["argv"][:]
+    argv[0] = backup
+    spawn(argv, LOGS + "/proxy-g5cur-rollback.log")
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        current = [item for item in procs() if item[0] == "mini-proxy"]
+        if len(current) == 1 and process_digest("mini-proxy")["sha256"] == state["old_sha256"]:
+            say("原 proxy 已恢复，回滚证据保留在 " + PROXY_RECOVERY)
+            return
+        time.sleep(0.3)
+    die("原 proxy 未能恢复；保留 " + PROXY_RECOVERY)
+
+
+def finalize_proxy():
+    """After success, discard the backup only after checking the running proxy."""
+    state_path = os.path.join(PROXY_RECOVERY, "state.json")
+    with open(state_path, encoding="utf-8") as handle:
+        state = json.load(handle)
+    if process_digest("mini-proxy")["sha256"] != state["new_sha256"]:
+        die("当前 proxy 身份不匹配，保留回滚文件")
+    os.remove(state_path)
+    os.remove(os.path.join(PROXY_RECOVERY, "mini-proxy.saved"))
+    os.rmdir(PROXY_RECOVERY)
+    say("proxy 运行身份已确认")
 
 
 def swap_proxy():
@@ -664,6 +753,23 @@ def swap_proxy():
         die("proxy 没有连接 165 的 API")
     if not os.path.isfile(PROXY_BIN):
         die("没有 " + PROXY_BIN)
+    if os.path.exists(PROXY_RECOVERY):
+        die("存在上轮 proxy 恢复目录，须先检查 " + PROXY_RECOVERY)
+    old_sha = process_digest("mini-proxy")["sha256"]
+    with open(PROXY_BIN, "rb") as binary:
+        new_sha = hashlib.sha256(binary.read()).hexdigest()
+    os.mkdir(PROXY_RECOVERY, 0o700)
+    backup = os.path.join(PROXY_RECOVERY, "mini-proxy.saved")
+    with open("/proc/%d/exe" % pid, "rb") as source, open(backup, "xb") as dest:
+        shutil.copyfileobj(source, dest)
+        dest.flush()
+        os.fsync(dest.fileno())
+    os.chmod(backup, 0o700)
+    with open(backup, "rb") as saved:
+        if hashlib.sha256(saved.read()).hexdigest() != old_sha:
+            die("原 proxy 备份校验失败")
+    atomic_json(os.path.join(PROXY_RECOVERY, "state.json"),
+                {"argv": argv, "old_sha256": old_sha, "new_sha256": new_sha, "at": now_iso()}, 0o600)
     new = argv[:]
     new[0] = PROXY_BIN
     stop_pid(pid, root=False)
@@ -693,15 +799,21 @@ def runtime_baseline(node):
         die(node + " 租约不是基线: " + " ".join(leases))
     if containers or sandboxes:
         die(node + " 还有 mini-k8s 容器")
-    return {"leases": leases, "containers": containers, "sandboxes": sandboxes, "at": now_iso()}
+    snapshot = local_snapshot(node, [], False)
+    snapshot["at"] = now_iso()
+    return snapshot
 
 
 def prepare_a():
     if os.geteuid() != 0:
         die("prepare-a 需要 sudo")
     image_present("node-a")
+    identity = verify_processes(read_json("g4-manifest.json")["sha256"], ("mini-agent",))
+    runtime_baseline("node-a")
     pid = swap_proxy()
     report = runtime_baseline("node-a")
+    identity.update(verify_processes(read_json("build.json")["sha256"], ("mini-proxy",)))
+    report["identities"] = identity
     write_json("baseline-a.json", report)
     os.chmod(os.path.join(ev(), "baseline-a.json"), 0o644)
     emit({"ok": True, "proxy": pid})
@@ -710,18 +822,25 @@ def prepare_a():
 def prepare_b():
     if os.geteuid() != 0:
         die("prepare-b 需要 sudo")
+    if any(item[0] == "root-helper" for item in procs()) or any(os.path.exists(path) for path in (ROOT_REQ, ROOT_ACK, PROXY_RECOVERY)):
+        die("node-b 存在上轮取证进程或未处理请求；保留现场并停止")
     image_present("node-b")
     _role, _pid, argv = one("mini-agent")
     if "https://127.0.0.1:18443" not in argv:
         die("node-b Agent 没有走本机转发")
+    agent_identity = process_digest("mini-agent")
+    if len(sys.argv) < 3 or agent_identity["sha256"] != sys.argv[2]:
+        die("node-b Agent 的实际运行二进制与 G4 构建不一致")
+    runtime_baseline("node-b")
     pid = swap_proxy()
     report = runtime_baseline("node-b")
+    report["identities"] = {"mini-agent": agent_identity, "mini-proxy": process_digest("mini-proxy")}
+    with open(PROXY_BIN, "rb") as binary:
+        if report["identities"]["mini-proxy"]["sha256"] != hashlib.sha256(binary.read()).hexdigest():
+            die("node-b proxy 的实际运行二进制与上传文件不一致")
     with open("/tmp/g5cur-baseline-b.json", "w", encoding="utf-8") as handle:
         json.dump(report, handle)
     os.chmod("/tmp/g5cur-baseline-b.json", 0o644)
-    for item in procs():
-        if item[0] == "root-helper":
-            stop_pid(item[1], root=False)
     if os.path.exists(ROOT_STOP):
         os.remove(ROOT_STOP)
     spawn([sys.executable, os.path.abspath(sys.argv[0]), "root-helper"], LOGS + "/g5cur-root-helper.log", root=False)
@@ -757,6 +876,11 @@ def root_helper():
                 result = {"ok": True, "hairpin": set_hairpin(sandbox_pid(info))}
             elif action == "snapshot":
                 result = {"ok": True, "snapshot": local_snapshot("node-b", data.get("ips") or [])}
+            elif action == "container-log":
+                uid = data["uid"]
+                cid = container_id("node-b", uid, False)
+                result = {"ok": True, "uid": uid, "containerID": cid,
+                          "log": cri(ENDPOINTS["node-b"], ["logs", cid], False)}
             else:
                 result = {"ok": False, "error": "unknown root action"}
         except Exception as err:
@@ -810,7 +934,12 @@ def cri_check():
         cmd.append("-expect-no-endpoint")
     else:
         cmd += ["-expect", ",".join(data.get("expect") or [])]
-    out = cri(ENDPOINTS["node-b"], cmd, False)
+    if data.get("noEndpoint"):
+        # 旧 fixture 对超时等拨号失败返回非零，但 stdout 仍含逐次证据。
+        proc = subprocess.run([CRICTL, "--runtime-endpoint", ENDPOINTS["node-b"], *cmd], capture_output=True, text=True, timeout=90)
+        out = proc.stdout
+    else:
+        out = cri(ENDPOINTS["node-b"], cmd, False)
     attempts = [json.loads(line) for line in str(out).splitlines() if line.startswith("{")]
     failed = [item for item in attempts if item.get("error")]
     emit({"ok": True, "attempts": attempts, "error": "" if not failed else "check error"})
@@ -836,13 +965,16 @@ def stop_forwarder():
 
 
 def start_forwarder():
-    if listening(18443) and any(item[0] == "forwarder" for item in procs()):
+    existing = [item for item in procs() if item[0] == "forwarder"]
+    if listening(18443) and len(existing) == 1:
         emit({"ok": True, "already": True})
         return
+    if existing or listening(18443):
+        die("转发进程与监听状态不一致，拒绝重复启动")
     spawn(["python3", FWD], LOGS + "/g5cur-forward.log", root=False)
     deadline = time.time() + 8
     while time.time() < deadline:
-        if listening(18443):
+        if listening(18443) and len([item for item in procs() if item[0] == "forwarder"]) == 1:
             emit({"ok": True, "already": False})
             return
         time.sleep(0.2)
@@ -958,15 +1090,42 @@ def scenario_01():
     target = service["spec"]["clusterIP"] + ":8081"
     expect = ["g5cur-a", "g5cur-b"]
     pod_uids = [( "pod-" + node_of(pod, table), node_of(pod, table), pod["metadata"]["uid"]) for pod in got]
+    access_started = time.time()
     results = check_sources(target, expect, pod_uids)
+    access_finished = time.time()
     ok, seen = covered(results, expect)
+    access_logs = {}
+    for pod in got:
+        uid = pod["metadata"]["uid"]
+        name = pod["metadata"]["name"]
+        node = node_of(pod, table)
+        if node == "node-a":
+            cid = container_id(node, uid, True)
+            raw = cri(ENDPOINTS[node], ["logs", cid], True)
+            log = {"uid": uid, "containerID": cid, "log": raw}
+        else:
+            log = ask_b("root-call", {"action": "container-log", "payload": {"uid": uid}}, timeout=40)
+            if log.get("ok") is not True or log.get("uid") != uid:
+                record("G5-01", False, "无法读取或核对 node-b 的容器访问日志")
+        events = []
+        for line in str(log.get("log") or "").splitlines():
+            try:
+                event = json.loads(line)
+                timestamp = datetime.fromisoformat(event["at"].replace("Z", "+00:00")).timestamp()
+                if event.get("kind") == "request" and event.get("identity") == name and access_started <= timestamp <= access_finished:
+                    events.append(event)
+            except (ValueError, KeyError, TypeError):
+                continue
+        log["windowRequests"] = events
+        access_logs[name] = log
+    logs_ok = all(access_logs.get(name, {}).get("windowRequests") for name in expect)
     rules_a = snapshot_a([service["spec"]["clusterIP"]])["rules"]
     rules_b = snapshot_b([service["spec"]["clusterIP"]])["rules"]
     rules_ok = rules_a.get(service["spec"]["clusterIP"], 0) > 0 and rules_b.get(service["spec"]["clusterIP"], 0) > 0
-    write_json("g501.json", {"service": service["metadata"]["uid"], "clusterIP": service["spec"]["clusterIP"], "results": results, "rulesA": rules_a, "rulesB": rules_b})
-    if not ok or not rules_ok:
-        record("G5-01", False, "四路覆盖 %s，规则计数 A=%s B=%s" % (sorted(seen), rules_a, rules_b))
-    record("G5-01", True, "四路各 20 次成功，身份覆盖两台，ClusterIP 规则已出现")
+    write_json("g501.json", {"service": service["metadata"]["uid"], "clusterIP": service["spec"]["clusterIP"], "results": results, "rulesA": rules_a, "rulesB": rules_b, "accessStarted": access_started, "accessFinished": access_finished, "accessLogs": access_logs})
+    if not ok or not rules_ok or not logs_ok:
+        record("G5-01", False, "四路覆盖 %s，规则计数 A=%s B=%s，容器访问日志=%s" % (sorted(seen), rules_a, rules_b, logs_ok))
+    record("G5-01", True, "四路各 20 次成功，两个容器的窗口内访问日志已保存，ClusterIP 规则已出现")
     return service["spec"]["clusterIP"]
 
 
@@ -1045,6 +1204,18 @@ def scenario_03(cluster_ip):
     time.sleep(3)
     target = service["spec"]["clusterIP"] + ":8081"
     pod_b = next(pod for pod in pods() if pod["metadata"]["name"] == "g5cur-b")
+    # G5-02 已删除 node-a 的业务 Pod，另建不匹配空 Service 的探测 Pod。
+    apply_text(pod_yaml("g5cur-empty-probe", SERVICE_IMAGE, ["/g5-service-fixture", "serve", "-listen", ":8080"], 1100, 67108864, 1100, 134217728, {"app": "g5cur-probe"}))
+    deadline = time.time() + 40
+    pod_a = None
+    while time.time() < deadline:
+        table = nodes()
+        pod_a = next((pod for pod in pods() if pod["metadata"]["name"] == "g5cur-empty-probe"), None)
+        if pod_a and (pod_a.get("status") or {}).get("phase") == "Running" and node_of(pod_a, table) == "node-a":
+            break
+        time.sleep(0.4)
+    else:
+        record("G5-03", False, "node-a 探测 Pod 没有运行")
     results = {}
     code, attempts, err = run_check(target, [], 20, True)
     results["host-a"] = {"code": code, "error": err, "summary": summarize(attempts), "attempts": attempts}
@@ -1052,12 +1223,32 @@ def scenario_03(cluster_ip):
     results["host-b"] = {"code": remote.get("code"), "summary": summarize(remote.get("attempts") or []), "attempts": remote.get("attempts") or []}
     remote = ask_b("cri-check", {"uid": pod_b["metadata"]["uid"], "target": target, "count": 20, "noEndpoint": True}, timeout=90)
     results["pod-b"] = {"summary": summarize(remote.get("attempts") or []), "attempts": remote.get("attempts") or []}
-    ok = all(item["summary"]["n"] == 20 and item["summary"]["success"] == 0 and not any(row.get("error") and row.get("outcome") != "refused" for row in item["attempts"]) for item in results.values())
-    refused = all(all(row.get("outcome") == "refused" and not row.get("error") for row in item["attempts"]) for item in results.values())
-    write_json("g503.json", {"clusterIP": service["spec"]["clusterIP"], "results": {key: value["summary"] for key, value in results.items()}, "refused": refused})
-    if not refused:
-        record("G5-03", False, "无端点没有三路都立即拒绝")
-    record("G5-03", True, "宿主机 A、宿主机 B、Pod B 各 20 次立即拒绝")
+    cid_a = container_id("node-a", pod_a["metadata"]["uid"], True)
+    cmd = ["sudo", "-n", CRICTL, "--runtime-endpoint", ENDPOINTS["node-a"], "exec", cid_a, "/g5-service-fixture", "check", "-target", target, "-count", "20", "-timeout", "2500ms", "-expect-no-endpoint"]
+    probe = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    attempts_a = [json.loads(line) for line in probe.stdout.splitlines() if line.startswith("{")]
+    results["pod-a"] = {"code": probe.returncode, "error": probe.stderr, "summary": summarize(attempts_a), "attempts": attempts_a, "uid": pod_a["metadata"]["uid"], "containerID": cid_a}
+    def dial_failed_in_time(row):
+        try:
+            started = datetime.fromisoformat(row["start"].replace("Z", "+00:00"))
+            ended = datetime.fromisoformat(row["end"].replace("Z", "+00:00"))
+            elapsed = (ended - started).total_seconds()
+            refused = row.get("outcome") == "refused" and not row.get("error")
+            failed_dial = not row.get("outcome") and str(row.get("error", "")).startswith("dial tcp ")
+            return 0 <= elapsed <= 3 and (refused or failed_dial) and not row.get("local")
+        except (KeyError, TypeError, ValueError):
+            return False
+    ok = all(len(item["attempts"]) == 20 and all(dial_failed_in_time(row) for row in item["attempts"]) for item in results.values())
+    write_json("g503.json", {"clusterIP": service["spec"]["clusterIP"], "results": results})
+    if not ok:
+        record("G5-03", False, "四路连接失败类型或 3 秒时限未得到完整验证")
+    delete_names("Pod", ["g5cur-empty-probe"])
+    deadline = time.time() + 30
+    while time.time() < deadline and any(pod["metadata"]["uid"] == pod_a["metadata"]["uid"] for pod in pods()):
+        time.sleep(0.4)
+    if any(pod["metadata"]["uid"] == pod_a["metadata"]["uid"] for pod in pods()):
+        record("G5-03", False, "node-a 探测 Pod 未及时清理")
+    record("G5-03", True, "两侧宿主机和两侧 Pod 各 20 次连接均在 3 秒内失败")
 
 
 def restart_role(role, root, node_name=""):
@@ -1087,10 +1278,21 @@ def restart_role(role, root, node_name=""):
 def scenario_04(cluster_ip):
     say("开始 G5-04")
     before = {(pod["metadata"]["uid"], (pod.get("status") or {}).get("restartCount") or 0) for pod in pods()}
-    ask_b("nodeb-restart", timeout=40)
-    restart_role("mini-agent", True, "node-a")
-    restart_role("mini-manager", False)
-    restart_role("mini-api", False)
+    runtime_restarts = []
+    # 核查每次重启前后两侧 CRI，而非仅凭 API 状态推断运行实例。
+    for role, restart in (
+        ("node-b agent", lambda: ask_b("nodeb-restart", timeout=40)),
+        ("node-a agent", lambda: restart_role("mini-agent", True, "node-a")),
+        ("manager", lambda: restart_role("mini-manager", False)),
+        ("api", lambda: restart_role("mini-api", False)),
+    ):
+        prior = {"a": snapshot_a([]), "b": snapshot_b([])}
+        restart()
+        current = {"a": snapshot_a([]), "b": snapshot_b([])}
+        runtime_restarts.append({"role": role, "before": prior, "after": current, "at": now_iso()})
+        write_json("g504-runtime.json", runtime_restarts)
+        if any(sorted(prior[node][kind]) != sorted(current[node][kind]) for node in ("a", "b") for kind in ("containers", "sandboxes")):
+            record("G5-04", False, role + " 重启前后容器或 sandbox 身份发生变化")
     time.sleep(3)
     after = {(pod["metadata"]["uid"], (pod.get("status") or {}).get("restartCount") or 0) for pod in pods()}
     if before != after:
@@ -1160,21 +1362,29 @@ def recover_etcd():
         return
     with open(ETCD_ARGV, encoding="utf-8") as handle:
         argv = json.load(handle)["argv"]
-    running = False
+    matching = []
     for name in os.listdir("/proc"):
         if not name.isdigit():
             continue
         try:
-            text = open("/proc/%s/cmdline" % name, "rb").read().replace(b"\0", b" ").decode("utf-8", "replace")
+            raw = open("/proc/%s/cmdline" % name, "rb").read()
         except OSError:
             continue
+        current = [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+        text = " ".join(current)
         if "etcd" in text and HOME + "/etcd" in text:
-            running = True
-    if not running:
+            matching.append(current)
+    if matching and (len(matching) != 1 or matching[0] != argv):
+        die("etcd 进程身份不匹配；保留故障标记")
+    if not matching:
         spawn(argv, LOGS + "/etcd-g5cur-restart.log", root=False)
     deadline = time.time() + 25
     while time.time() < deadline:
-        proc = subprocess.run(["etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"], capture_output=True, text=True)
+        try:
+            proc = subprocess.run(["etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"], capture_output=True, text=True, timeout=2)
+        except subprocess.TimeoutExpired:
+            time.sleep(0.4)
+            continue
         if proc.returncode == 0:
             if os.path.exists(ETCD_FLAG):
                 os.remove(ETCD_FLAG)
@@ -1226,8 +1436,12 @@ def scenario_05(cluster_ip):
 
     thread = threading.Thread(target=loop, daemon=True)
     thread.start()
-    while not any("nodes" in sample for sample in samples):
+    deadline = time.time() + 20
+    while not any("nodes" in sample for sample in samples) and time.time() < deadline:
         time.sleep(0.1)
+    if not any("nodes" in sample for sample in samples):
+        stop["value"] = True
+        record("G5-05", False, "无法开始健康侧采样")
     with open(FWD_FLAG, "w", encoding="utf-8") as handle:
         handle.write(now_iso() + "\n")
     ask_b("stop-forwarder", timeout=20)
@@ -1246,8 +1460,23 @@ def scenario_05(cluster_ip):
         stop["value"] = True
         record("G5-05", False, "切断后没有看到 Unknown")
     time.sleep(max(0, unknown_at + 6 - time.time()))
-    late = [item for sample in samples if sample["at"] >= unknown_at + 5 for item in sample.get("attempts") or []]
+    def completed_after(item, since):
+        try:
+            start = datetime.fromisoformat(item["start"].replace("Z", "+00:00")).timestamp()
+            end = datetime.fromisoformat(item["end"].replace("Z", "+00:00")).timestamp()
+            return start >= since and end >= start and bool(item.get("outcome") or item.get("error"))
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    late = [item for sample in samples for item in sample.get("attempts") or [] if completed_after(item, unknown_at + 5)]
     late_hits = [item for item in late if item.get("identity") == "g5cur-b" and item.get("outcome") == "success"]
+    # 本场景只剩 node-b 后端；无路由、超时等无法证明端点已摘除。
+    def target_refused(item):
+        error = str(item.get("error") or "")
+        return (item.get("outcome") == "refused" and not error) or (
+            not item.get("outcome") and error.startswith("dial tcp " + target + ":")
+            and error.endswith("connection refused")
+        )
     ask_b("cri-set", {"uid": pod_b["metadata"]["uid"], "state": "off"}, timeout=30)
     ask_b("start-forwarder", timeout=20)
     if os.path.exists(FWD_FLAG):
@@ -1263,11 +1492,12 @@ def scenario_05(cluster_ip):
         record("G5-05", False, "转发恢复后 30 秒内没有都 Ready")
     restored = next(pod for pod in pods() if pod["metadata"]["uid"] == pod_b["metadata"]["uid"])
     stale_ready = aligned(restored, nodes())
-    quiet_hits = []
-    until = time.time() + 6
+    quiet_attempts = []
+    quiet_start = time.time()
+    until = quiet_start + 6
     while time.time() < until:
         _code, got, _err = run_check(target, ["g5cur-b"], 1)
-        quiet_hits.extend(item for item in got if item.get("outcome") == "success")
+        quiet_attempts.extend(got)
         time.sleep(0.3)
     on = ask_b("cri-set", {"uid": pod_b["metadata"]["uid"], "state": "on"}, timeout=30)
     ready_at = None
@@ -1287,8 +1517,10 @@ def scenario_05(cluster_ip):
             time.sleep(0.2)
     stop["value"] = True
     thread.join(timeout=3)
-    write_json("g505.json", {"unknownAt": unknown_at, "heartbeat": heartbeat, "lateHits": len(late_hits), "staleReady": stale_ready, "quietHits": len(quiet_hits), "rejoin": None if not hit_at else hit_at - ready_at})
-    if late_hits or stale_ready or quiet_hits or hit_at is None or hit_at - ready_at > 10:
+    quiet_attempts = [item for item in quiet_attempts if completed_after(item, quiet_start)]
+    quiet_hits = [item for item in quiet_attempts if item.get("outcome") == "success"]
+    write_json("g505.json", {"unknownAt": unknown_at, "heartbeat": heartbeat, "samples": samples, "late": late, "lateHits": len(late_hits), "staleReady": stale_ready, "quietAttempts": quiet_attempts, "quietHits": len(quiet_hits), "rejoin": None if not hit_at else hit_at - ready_at})
+    if not late or not quiet_attempts or not all(target_refused(item) for item in late + quiet_attempts) or late_hits or stale_ready or quiet_hits or hit_at is None or hit_at - ready_at > 10:
         record("G5-05", False, "失联摘除或恢复后的旧 Ready 不符合")
     record("G5-05", True, "Unknown 后 5 秒不再命中 g5cur-b；恢复后未监听时没有加入；Ready 后 %.1f 秒重新命中" % (hit_at - ready_at))
 
@@ -1351,9 +1583,15 @@ def scenario_06():
             record("G5-06", False, "scale %d 失败" % replicas)
         deadline = scale_started + 30
         while time.time() < deadline:
-            owned = [pod for pod in pods() if pod["metadata"].get("ownerUID") == rs_name_uid and not pod["metadata"].get("deletionTimestamp") and (pod.get("status") or {}).get("phase") == "Running"]
-            if len(owned) == replicas:
-                marks.append({"replicas": replicas, "elapsed": time.time() - scale_started})
+            owned = [pod for pod in pods() if pod["metadata"].get("ownerUID") == rs_name_uid]
+            running = [pod for pod in owned if not pod["metadata"].get("deletionTimestamp") and (pod.get("status") or {}).get("phase") == "Running"]
+            snap_a = snapshot_a([])
+            snap_b = snapshot_b([])
+            cri_count = len(snap_a["containers"]) + len(snap_b["containers"])
+            sandbox_count = len(snap_a["sandboxes"]) + len(snap_b["sandboxes"])
+            elapsed = time.time() - scale_started
+            if elapsed <= 30 and len(owned) == replicas and len(running) == replicas and cri_count == replicas and sandbox_count == replicas:
+                marks.append({"replicas": replicas, "elapsed": elapsed, "at": now_iso(), "podUIDs": [pod["metadata"]["uid"] for pod in owned], "nodeA": snap_a, "nodeB": snap_b})
                 break
             time.sleep(0.4)
         else:
@@ -1374,24 +1612,28 @@ def scenario_07(service):
     delete_names("ReplicaSet", ["g5cur-demo"])
     deadline = started + 30
     last = {}
+    baseline_a = read_json("baseline-a.json")
+    baseline_b = read_json("baseline-b.json")
     while time.time() < deadline:
         table = nodes()
         snap_a = snapshot_a([ip])
         snap_b = snapshot_b([ip])
         pool = api_get("service-pool")
         claims = [item for item in pool.get("claims") or [] if item.get("ip") == ip]
-        last = {"a": snap_a, "b": snap_b, "claims": claims, "pods": len(pods()), "services": len(services()), "rs": len(replicasets()), "reserved": {name: reserved(node) for name, node in table.items()}}
+        last = {"at": now_iso(), "a": snap_a, "b": snap_b, "claims": claims, "pods": len(pods()), "services": len(services()), "rs": len(replicasets()), "reserved": {name: reserved(node) for name, node in table.items()}}
         clean = (
             last["pods"] == 0 and last["services"] == 0 and last["rs"] == 0
             and all(value == (0, 0) for value in last["reserved"].values())
-            and snap_a["leases"] == ["last_reserved_ip.0", "lock"] and snap_b["leases"] == ["last_reserved_ip.0", "lock"]
-            and not snap_a["containers"] and not snap_a["sandboxes"] and not snap_b["containers"] and not snap_b["sandboxes"]
+            and snap_a["leases"] == baseline_a["leases"] and snap_b["leases"] == baseline_b["leases"]
+            and snap_a["containers"] == baseline_a["containers"] and snap_a["sandboxes"] == baseline_a["sandboxes"]
+            and snap_b["containers"] == baseline_b["containers"] and snap_b["sandboxes"] == baseline_b["sandboxes"]
+            and snap_a["iptables"] == baseline_a["iptables"] and snap_b["iptables"] == baseline_b["iptables"]
             and snap_a["rules"].get(ip, 0) == 0 and snap_b["rules"].get(ip, 0) == 0
             and len(claims) == 1 and claims[0].get("state") == "retained" and claims[0].get("uid") == uid
         )
-        if clean:
-            elapsed = time.time() - started
-            write_json("g507.json", {"elapsed": elapsed, "clusterIP": ip, "claim": claims[0], "available": pool.get("available"), "capacity": pool.get("capacity")})
+        elapsed = time.time() - started
+        if clean and elapsed <= 30:
+            write_json("g507.json", {"elapsed": elapsed, "clusterIP": ip, "claim": claims[0], "available": pool.get("available"), "capacity": pool.get("capacity"), "last": last, "baselineA": baseline_a, "baselineB": baseline_b})
             record("G5-07", True, "%.1f 秒内 Pod、RS、Service、预留、两侧租约和转发规则回到基线；%s 仍是 retained，没有释放" % (elapsed, ip))
             return
         time.sleep(0.5)
@@ -1403,7 +1645,9 @@ def recover_forwarder():
     if not os.path.exists(FWD_FLAG):
         return
     try:
-        ask_b("start-forwarder", timeout=20)
+        result = ask_b("start-forwarder", timeout=20)
+        if result.get("ok") is not True:
+            die("node-b 转发未确认恢复")
         os.remove(FWD_FLAG)
         say("已重新拉起 node-b 转发")
     except SystemExit:
@@ -1424,11 +1668,12 @@ def driver():
         die("sudo 没有通过")
     refresher = threading.Thread(target=sudo_refresh, daemon=True)
     refresher.start()
-    if os.path.basename(one("mini-proxy")[2][0]) != "mini-proxy.g4cur":
-        die("node-a proxy 还不是 g4cur")
-    remote = ask_b("proxy-name", timeout=20)
-    if remote.get("argv0") != "mini-proxy.g4cur":
-        die("node-b proxy 还不是 g4cur")
+    baseline = read_json("baseline-b.json")
+    identities = baseline.get("identities") or {}
+    if identities.get("mini-agent", {}).get("sha256") != read_json("g4-manifest.json")["sha256"].get("mini-agent"):
+        die("node-b Agent 的实际运行二进制与 G4 构建不一致")
+    if identities.get("mini-proxy", {}).get("sha256") != read_json("build.json")["sha256"].get("mini-proxy"):
+        die("node-b proxy 的实际运行二进制与 G5 构建不一致")
     if pods():
         die("开始前发现 Pod")
     try:
@@ -1487,6 +1732,8 @@ def main():
         "driver": driver,
         "report": report,
         "recover-etcd": recover_etcd,
+        "rollback-proxy": rollback_proxy,
+        "finalize-proxy": finalize_proxy,
     }
     if len(sys.argv) < 2 or sys.argv[1] not in actions:
         die("unknown command")

@@ -1,4 +1,4 @@
-# One command for same-version G5-01 through G5-07.
+﻿# One command for same-version G5-01 through G5-07.
 # Run from Windows. The two workers cannot SSH to each other.
 # Usage:
 #   pwsh -File ".\scripts\acceptance\g5-live.ps1"
@@ -19,6 +19,9 @@ $EtcdFlag = "$RemoteHome/g5cur-etcd-down"
 $RootStop = "$RemoteHome/g5cur-root.stop"
 $LocalPy = Join-Path $PSScriptRoot "g5_live.py"
 $Watcher = $null
+$RunLock = "$RemoteHome/.r1-live.lock"
+$LockOwned = $false
+$Completed = $false
 
 function Invoke-Node {
     param(
@@ -87,7 +90,7 @@ function Remote-Sha {
 }
 
 Write-Host "G5 同一版本验收。全程大约 15 到 20 分钟，请不要关闭这个窗口。"
-Write-Host "会要三次 sudo 密码：165 换上新 proxy，125 换上新 proxy 并留下取证进程，165 跑完全部场景。"
+Write-Host "两台机器运行场景和最终核对时可能多次提示输入 sudo 密码。"
 Write-Host "中间会暂停 etcd 10 秒，脚本会自己把它拉起来。失败时也会恢复 etcd 和 node-b 转发。"
 Write-Host "脚本不会把 G5 记成通过。跑完后把 G5-01 到 G5-07 的结果发回来。"
 Write-Host ""
@@ -100,6 +103,9 @@ if (-not (Test-Path $KeyA) -or -not (Test-Path $KeyB)) {
 }
 
 try {
+    Write-Host "获取验收运行锁"
+    Invoke-Node $IpA $KeyA "mkdir -- $RunLock"
+    $LockOwned = $true
     Write-Host "上传验收程序"
     Copy-Between $KeyA $LocalPy "${IpA}:$RemotePy"
     Copy-Between $KeyB $LocalPy "${IpB}:$RemotePy"
@@ -113,23 +119,23 @@ try {
     Invoke-Node $IpA $KeyA "python3 -u $RemotePy build"
 
     $Stamp = [guid]::NewGuid().ToString("N")
-    $ProxyLocal = Join-Path $env:TEMP "mini-proxy.g4cur.$Stamp"
-    $FixLocal = Join-Path $env:TEMP "g5-service-fixture.g4cur.$Stamp"
-    $ProxyRemote = "$Bin/mini-proxy.g4cur.upload.$Stamp"
-    $FixRemote = "$Bin/g5-service-fixture.g4cur.upload.$Stamp"
-    Copy-Between $KeyA "${IpA}:$Bin/mini-proxy.g4cur" $ProxyLocal
-    Copy-Between $KeyA "${IpA}:$Bin/g5-service-fixture.g4cur" $FixLocal
+    $ProxyLocal = Join-Path $env:TEMP "mini-proxy.g5cur.$Stamp"
+    $FixLocal = Join-Path $env:TEMP "g5-service-fixture.g5cur.$Stamp"
+    $ProxyRemote = "$Bin/mini-proxy.g5cur.upload.$Stamp"
+    $FixRemote = "$Bin/g5-service-fixture.g5cur.upload.$Stamp"
+    Copy-Between $KeyA "${IpA}:$Bin/mini-proxy.g5cur" $ProxyLocal
+    Copy-Between $KeyA "${IpA}:$Bin/g5-service-fixture.g5cur" $FixLocal
     Copy-Between $KeyB $ProxyLocal "${IpB}:$ProxyRemote"
     Copy-Between $KeyB $FixLocal "${IpB}:$FixRemote"
-    $ProxyA = Remote-Sha $KeyA $IpA "$Bin/mini-proxy.g4cur"
+    $ProxyA = Remote-Sha $KeyA $IpA "$Bin/mini-proxy.g5cur"
     $ProxyB = Remote-Sha $KeyB $IpB $ProxyRemote
-    $FixA = Remote-Sha $KeyA $IpA "$Bin/g5-service-fixture.g4cur"
+    $FixA = Remote-Sha $KeyA $IpA "$Bin/g5-service-fixture.g5cur"
     $FixB = Remote-Sha $KeyB $IpB $FixRemote
     if ($ProxyA -ne $ProxyB -or $FixA -ne $FixB -or -not $ProxyA -or -not $FixA) {
         Invoke-Node $IpB $KeyB "rm -f -- $ProxyRemote $FixRemote"
         throw "传到 node-b 的程序和 node-a 不一致，没有替换"
     }
-    Invoke-Node $IpB $KeyB "chmod 755 $ProxyRemote $FixRemote && mv -f -- $ProxyRemote $Bin/mini-proxy.g4cur && mv -f -- $FixRemote $Bin/g5-service-fixture.g4cur"
+    Invoke-Node $IpB $KeyB "chmod 755 $ProxyRemote $FixRemote && mv -f -- $ProxyRemote $Bin/mini-proxy.g5cur && mv -f -- $FixRemote $Bin/g5-service-fixture.g5cur"
     Write-Host "proxy 和检查程序已复制到 node-b"
 
     Write-Host ""
@@ -138,7 +144,11 @@ try {
 
     Write-Host ""
     Write-Host "第 2 次 sudo：10.128.176.125。换 proxy，核对镜像和租约，留下只做 hairpin 和快照的 root 进程。"
-    Invoke-Node $IpB $KeyB "sudo python3 -u $RemotePy prepare-b" -Tty
+    $ManifestText = (& ssh -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpA "cat $Evidence/g4-manifest.json" | Out-String)
+    if ($LASTEXITCODE -ne 0) { throw "无法读取 G4 构建清单" }
+    $AgentHash = ($ManifestText | ConvertFrom-Json).sha256.'mini-agent'
+    if ($AgentHash -notmatch '^[0-9a-f]{64}$') { throw "G4 Agent 摘要无效" }
+    Invoke-Node $IpB $KeyB "sudo python3 -u $RemotePy prepare-b $AgentHash" -Tty
     $Baseline = Join-Path $env:TEMP "g5cur-baseline-b.json"
     Copy-Between $KeyB "${IpB}:/tmp/g5cur-baseline-b.json" $Baseline
     Copy-Between $KeyA $Baseline "${IpA}:$Evidence/baseline-b.json"
@@ -187,10 +197,12 @@ try {
     Write-Host "第 3 次 sudo：10.128.176.165。输入密码之后不需要再操作。"
     Write-Host "G5-06 会稳定 5 分钟，大约每分钟打印一行。"
     Invoke-Node $IpA $KeyA "python3 -u $RemotePy driver" -Tty
+    $Completed = $true
     Write-Host ""
     Write-Host "跑完了。把上面的 G5-01 到 G5-07 结果发回来。这还不是 mini demo 验收通过。"
 }
 finally {
+    if ($LockOwned) {
     if ($Watcher) {
         Stop-Job $Watcher -ErrorAction SilentlyContinue
         Remove-Job $Watcher -Force -ErrorAction SilentlyContinue
@@ -209,10 +221,21 @@ finally {
         if ($fwdDown -match "DOWN") {
             Write-Host "场景中断，正在恢复 node-b 转发"
             & ssh -i $KeyB -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpB "python3 -u $RemotePy start-forwarder"
+            if ($LASTEXITCODE -ne 0) { throw "node-b 转发恢复失败，保留故障标记" }
             & ssh -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpA "rm -f $FwdFlag"
         }
     } catch {
         Write-Host "恢复 node-b 转发时出错"
+    }
+    if (-not $Completed) {
+        foreach ($target in @(@($IpA, $KeyA), @($IpB, $KeyB))) {
+            Write-Host "尝试恢复 $($target[0]) 原 proxy；失败时保留现场和运行锁"
+            try {
+                Invoke-Node $target[0] $target[1] "sudo python3 -u $RemotePy rollback-proxy" -Tty
+            } catch {
+                Write-Host "原 proxy 未确认恢复：$($target[0])"
+            }
+        }
     }
     try {
         & ssh -i $KeyB -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpB "touch $RootStop"
@@ -222,5 +245,23 @@ finally {
     try {
         & ssh -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpA "python3 -u $RemotePy report"
     } catch {
+    }
+    if ($LockOwned -and $Completed) {
+        foreach ($target in @(@($IpA, $KeyA), @($IpB, $KeyB))) {
+            try {
+                Write-Host "核对 $($target[0]) 的 proxy，可能需要输入 sudo 密码。"
+                Invoke-Node $target[0] $target[1] "sudo python3 -u $RemotePy finalize-proxy" -Tty
+            } catch {
+                $Completed = $false
+                Write-Host "proxy 身份未确认，运行锁已保留：$($target[0])"
+            }
+        }
+    }
+    if ($LockOwned -and $Completed) {
+        & ssh -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpA "if test ! -e $EtcdFlag && test ! -e $FwdFlag; then rmdir -- $RunLock; else exit 1; fi"
+        if ($LASTEXITCODE -ne 0) { Write-Host "恢复状态未确认，运行锁已保留，请检查现场。" }
+    } elseif ($LockOwned) {
+        Write-Host "验收未正常结束，运行锁已保留；确认故障标记、组件和测试资源后再人工处理。"
+    }
     }
 }

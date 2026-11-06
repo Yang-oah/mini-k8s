@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"math/rand"
 	"net/http"
 	"reflect"
 	"time"
@@ -75,7 +76,9 @@ func (s *Server) create(ctx context.Context, w http.ResponseWriter, r *http.Requ
 		// 对选择器和标记取一致快照，再在事务中比较标记版本，
 		// 防止并发创建时两个重叠的选择器同时通过检查。
 		marker := prefix + "replicaset-selector-revision"
-		for attempt := 0; attempt < 5; attempt++ {
+		// 冲突只说明其他 RS 同时改变了选择器集合；有界退避后重新检查，
+		// 不将无关对象的竞争误报为资源已存在。请求超时仍由 ctx 限制。
+		for attempt := 0; attempt < 128; attempt++ {
 			snapshot, snapshotErr := s.Client.Txn(ctx).Then(clientv3.OpGet(resourceKey("replicasets", ""), clientv3.WithPrefix()), clientv3.OpGet(marker)).Commit()
 			if snapshotErr != nil {
 				respondError(503, "Unavailable", "storage unavailable")
@@ -97,9 +100,27 @@ func (s *Server) create(ctx context.Context, w http.ResponseWriter, r *http.Requ
 			if len(markerKVs) > 0 {
 				markerRevision = markerKVs[0].ModRevision
 			}
-			tx, err = s.Client.Txn(ctx).If(clientv3.Compare(clientv3.Version(k), "=", 0), clientv3.Compare(clientv3.ModRevision(marker), "=", markerRevision)).Then(clientv3.OpPut(k, encodeObject(o)), clientv3.OpPut(marker, o.meta.UID)).Commit()
+			tx, err = s.Client.Txn(ctx).If(clientv3.Compare(clientv3.Version(k), "=", 0), clientv3.Compare(clientv3.ModRevision(marker), "=", markerRevision)).Then(clientv3.OpPut(k, encodeObject(o)), clientv3.OpPut(marker, o.meta.UID)).Else(clientv3.OpGet(k)).Commit()
 			if err != nil || tx.Succeeded {
 				break
+			}
+			if len(tx.Responses[0].GetResponseRange().Kvs) != 0 {
+				respondError(409, "Conflict", "resource already exists")
+				return
+			}
+			if attempt == 127 {
+				respondError(503, "Unavailable", "concurrent selector updates; retry request")
+				return
+			}
+			// 随机抖动避免多个请求持续同步地重新读取和竞争同一标记。
+			delay := time.Duration(1+rand.Intn(20)) * time.Millisecond
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				respondError(503, "Unavailable", "storage unavailable")
+				return
+			case <-timer.C:
 			}
 		}
 	} else if who.role == "controller" {
