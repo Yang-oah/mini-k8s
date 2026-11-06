@@ -4,7 +4,7 @@ set -uo pipefail
 # R1 当前快照的 G3 交互式入口；实际断言与清理仍由 g3.sh 执行。
 # 可通过环境变量覆盖测试机相关参数，但源码必须匹配已验证的 R1 快照。
 source_dir="${R1_SOURCE_DIR:-/home/lihaoyang/mini-k8s-g4/evidence/r1-selector-v10-I2MJLyAh}"
-expected_sha="1a8537f578953716d9c2c9858b2f2421d2ff961c1ea8212b9c3e3991e9e401a8"
+expected_sha="${R1_EXPECTED_SHA:-1a8537f578953716d9c2c9858b2f2421d2ff961c1ea8212b9c3e3991e9e401a8}"
 image="${G3_TEST_IMAGE:-docker.io/library/busybox@sha256:5b3a16922a16714dac5c393ed0807e516e9f2b7b3d0602baef6b8e38a46aaf88}"
 pod_cidr="${G3_POD_CIDR:-10.88.0.0/24}"
 cni_network="${G3_CNI_NETWORK:-mini-k8s}"
@@ -12,6 +12,10 @@ containerd_config="${G3_CONTAINERD_CONFIG:-/etc/containerd/config.toml}"
 cri="${G3_CRI_ENDPOINT:-unix:///run/containerd/containerd.sock}"
 test_path="${R1_TEST_PATH:-/home/lihaoyang/.local/go/bin:/home/lihaoyang/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
 
+if [[ "$source_dir" != /* || "/$source_dir/" == *"/../"* || ! "$expected_sha" =~ ^[0-9a-f]{64}$ ]]; then
+  printf 'BLOCKED: invalid source directory or SHA-256.\n' >&2
+  exit 2
+fi
 if [[ ! -d "$source_dir" || ! -f "$source_dir/scripts/acceptance/g3.sh" ]]; then
   printf 'BLOCKED: source directory or G3 script is missing: %s\n' "$source_dir" >&2
   exit 2

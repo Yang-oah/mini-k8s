@@ -1,5 +1,7 @@
 # R1-A 只读采样验证记录
 
+本文保留 R1 的早期只读采样。PR #8 合并版本的六档读写基线和指标缺口见 [R1 设计与验收记录](r1-reliability-design.md#当前一次性验收清单)。
+
 本记录验证 API 和 etcd 只读采集器，不代表整个 R1 或完整容量目标通过。证据位于控制面 `/home/lihaoyang/mini-k8s-g4/evidence/r1-final-20261105-MnC9KvgD/`；其中 `fixture-events.jsonl` 是本轮测试对象创建、身份和清理日志，`rs*-read-*` 是 API 请求记录，`rs*-etcd-*.json` 是采样前后 etcd 指标。
 
 - 运行时业务源码快照 SHA-256：`4933ed318f8dcdb14c36cdc6d37d6696df4cfc59991b5ae3786198008c2e3fb8`（沿用 G5 验收记录的 `cmd`、`internal`、`go.mod` 和 `go.sum` 同口径摘要）。

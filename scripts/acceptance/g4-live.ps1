@@ -11,6 +11,11 @@ $IpB = "lihaoyang@10.128.176.125"
 $KeyA = Join-Path $env:USERPROFILE ".ssh\id_ed25519"
 $KeyB = Join-Path $env:USERPROFILE ".ssh\id_rsa"
 $RemotePy = "/home/lihaoyang/mini-k8s-g4/g4_live.py"
+$SourceDir = if ($env:R1_SOURCE_DIR) { $env:R1_SOURCE_DIR } else { "/home/lihaoyang/mini-k8s-g4/evidence/r1-selector-v10-I2MJLyAh" }
+$ExpectedSha = if ($env:R1_EXPECTED_SHA) { $env:R1_EXPECTED_SHA } else { "1a8537f578953716d9c2c9858b2f2421d2ff961c1ea8212b9c3e3991e9e401a8" }
+if ($SourceDir -notmatch '^/[A-Za-z0-9_./-]+$' -or $SourceDir -match '(^|/)\.\.(/|$)' -or $ExpectedSha -cnotmatch '^[0-9a-f]{64}$') { throw "源码目录必须是安全的 Linux 绝对路径，摘要必须是 64 位小写十六进制。" }
+$RemoteEnv = "R1_SOURCE_DIR=$SourceDir R1_EXPECTED_SHA=$ExpectedSha"
+
 $Agent = "/home/lihaoyang/mini-k8s-g4/bin/mini-agent.g4cur"
 $Pointer = "/home/lihaoyang/mini-k8s-g4/g4cur-evidence.path"
 $FwdFlag = "/home/lihaoyang/mini-k8s-g4/g4cur-forwarder-down"
@@ -94,31 +99,31 @@ try {
     Copy-Between $KeyB $LocalPy "${IpB}:$RemotePy"
 
     Write-Host "先检查两台机器、源码和集群状态"
-    Invoke-Node $IpA $KeyA "python3 -u $RemotePy readonly-precheck"
-    Invoke-Node $IpB $KeyB "python3 -u $RemotePy precheck-b"
+    Invoke-Node $IpA $KeyA "env $RemoteEnv python3 -u $RemotePy readonly-precheck"
+    Invoke-Node $IpB $KeyB "env $RemoteEnv python3 -u $RemotePy precheck-b"
 
     Write-Host ""
     Write-Host "第 1 次 sudo：10.128.176.165。只让 root 身份的 Agent 和 proxy 读取新证书，不跑场景。"
-    Invoke-Node $IpA $KeyA "python3 -u $RemotePy reload-root" -Tty
+    Invoke-Node $IpA $KeyA "env $RemoteEnv python3 -u $RemotePy reload-root" -Tty
 
     Write-Host "检查 165 上的源码和空集群"
-    Invoke-Node $IpA $KeyA "python3 -u $RemotePy precheck"
+    Invoke-Node $IpA $KeyA "env $RemoteEnv python3 -u $RemotePy precheck"
     $Evidence = Read-Evidence
     Write-Host "证据目录 $Evidence"
 
     Write-Host "如果上次中断，先把 node-b 转发拉起来"
-    Invoke-Node $IpB $KeyB "python3 -u $RemotePy start-forwarder"
-    Invoke-Node $IpB $KeyB "python3 -u $RemotePy precheck-b"
+    Invoke-Node $IpB $KeyB "env $RemoteEnv python3 -u $RemotePy start-forwarder"
+    Invoke-Node $IpB $KeyB "env $RemoteEnv python3 -u $RemotePy precheck-b"
 
     Write-Host ""
     Write-Host "第 2 次 sudo：10.128.176.125。先让 proxy 读取新证书，再只读镜像、容器和 IP 租约。"
-    Invoke-Node $IpB $KeyB "sudo python3 -u $RemotePy baseline-b" -Tty
+    Invoke-Node $IpB $KeyB "sudo env $RemoteEnv python3 -u $RemotePy baseline-b" -Tty
     $TempJson = Join-Path $env:TEMP "g4cur-baseline-b.json"
     Copy-Between $KeyB "${IpB}:/tmp/g4cur-baseline-b.json" $TempJson
     Copy-Between $KeyA $TempJson "${IpA}:$Evidence/baseline-b.json"
 
     Write-Host "编译当前源码"
-    Invoke-Node $IpA $KeyA "python3 -u $RemotePy build"
+    Invoke-Node $IpA $KeyA "env $RemoteEnv python3 -u $RemotePy build"
     Copy-Between $KeyA "${IpA}:$Agent" (Join-Path $env:TEMP "mini-agent.g4cur")
     # 运行中的可执行文件不能直接覆盖；先上传到同目录的唯一文件并校验。
     $AgentUpload = "$Agent.upload.$([guid]::NewGuid().ToString('N'))"
@@ -132,7 +137,7 @@ try {
     Write-Host "Agent 程序已复制到 node-b"
 
     $Watcher = Start-Job -Name g4curWatch -ScriptBlock {
-        param($KeyA, $KeyB, $IpA, $IpB, $RemotePy)
+        param($KeyA, $KeyB, $IpA, $IpB, $RemotePy, $RemoteEnv)
         $ErrorActionPreference = "Continue"
         $optsA = @("-i", $KeyA, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-T")
         $optsB = @("-i", $KeyB, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-T")
@@ -157,7 +162,7 @@ try {
             $payload = "{}"
             if ($req.payload) { $payload = $req.payload | ConvertTo-Json -Compress -Depth 6 }
             $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload))
-            $remote = "python3 -u $RemotePy $($req.action) '$b64'"
+            $remote = "env $RemoteEnv python3 -u $RemotePy $($req.action) '$b64'"
             Add-Content -Path $log -Value ("---- " + $req.action)
             $out = & ssh @optsB $IpB $remote 2>&1 | Out-String
             $ok = $LASTEXITCODE -eq 0
@@ -169,20 +174,20 @@ try {
             & scp -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new $tmp "${IpA}:/home/lihaoyang/mini-k8s-g4/g4cur-ack.tmp"
             & ssh @optsA $IpA "mv -f /home/lihaoyang/mini-k8s-g4/g4cur-ack.tmp /home/lihaoyang/mini-k8s-g4/g4cur-ack.json"
         }
-    } -ArgumentList $KeyA, $KeyB, $IpA, $IpB, $RemotePy
+    } -ArgumentList $KeyA, $KeyB, $IpA, $IpB, $RemotePy, $RemoteEnv
 
     Write-Host ""
     Write-Host "第 3 次 sudo：10.128.176.165。这次会换上新程序并跑完全部 G4 场景。"
     Write-Host "输入密码之后不需要再操作，直到它自己停下来。"
-    Invoke-Node $IpA $KeyA "python3 -u $RemotePy driver" -Tty
+    Invoke-Node $IpA $KeyA "env $RemoteEnv python3 -u $RemotePy driver" -Tty
 
     Write-Host ""
     Write-Host "第 4 次 sudo：10.128.176.125。核对租约和容器是否回到测试前。"
-    Invoke-Node $IpB $KeyB "sudo python3 -u $RemotePy final-b" -Tty
+    Invoke-Node $IpB $KeyB "sudo env $RemoteEnv python3 -u $RemotePy final-b" -Tty
     $Final = Join-Path $env:TEMP "g4cur-final-b.json"
     Copy-Between $KeyB "${IpB}:/tmp/g4cur-final-b.json" $Final
     Copy-Between $KeyA $Final "${IpA}:$Evidence/final-b.json"
-    Invoke-Node $IpA $KeyA "python3 -u $RemotePy finish"
+    Invoke-Node $IpA $KeyA "env $RemoteEnv python3 -u $RemotePy finish"
     $Completed = $true
     Write-Host ""
     Write-Host "跑完了。把上面的 G4-01 到 G4-06 结果发回来。这还不是 G5 通过。"
@@ -197,7 +202,7 @@ finally {
     }
     if ($flag -match "DOWN") {
         Write-Host "场景中断，正在恢复 node-b 转发"
-        & ssh -i $KeyB -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpB "python3 -u $RemotePy start-forwarder"
+        & ssh -i $KeyB -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpB "env $RemoteEnv python3 -u $RemotePy start-forwarder"
     }
     if ($Watcher) {
         Stop-Job $Watcher -ErrorAction SilentlyContinue
@@ -205,7 +210,7 @@ finally {
     }
     try {
         if (Test-Path (Join-Path $PSScriptRoot "g4_live.py")) {
-            & ssh -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpA "python3 -u $RemotePy report"
+            & ssh -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpA "env $RemoteEnv python3 -u $RemotePy report"
         }
     } catch {
     }

@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import shutil
 import ssl
 import subprocess
@@ -16,7 +17,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-SRC = "/home/lihaoyang/mini-k8s-g4/evidence/r1-selector-v10-I2MJLyAh"
+SRC = os.environ.get("R1_SOURCE_DIR", "/home/lihaoyang/mini-k8s-g4/evidence/r1-selector-v10-I2MJLyAh")
 HOME = "/home/lihaoyang/mini-k8s-g4"
 BIN = HOME + "/bin"
 LOGS = HOME + "/logs"
@@ -24,7 +25,7 @@ EV_PTR = HOME + "/g4cur-evidence.path"
 REQ = HOME + "/g4cur-request.json"
 ACK = HOME + "/g4cur-ack.json"
 FWD_FLAG = HOME + "/g4cur-forwarder-down"
-EXPECTED = "1a8537f578953716d9c2c9858b2f2421d2ff961c1ea8212b9c3e3991e9e401a8"
+EXPECTED = os.environ.get("R1_EXPECTED_SHA", "1a8537f578953716d9c2c9858b2f2421d2ff961c1ea8212b9c3e3991e9e401a8")
 BUSYBOX = "docker.io/library/busybox@sha256:5b3a16922a16714dac5c393ed0807e516e9f2b7b3d0602baef6b8e38a46aaf88"
 PROBE_IMAGE = "docker.io/library/g4-probe@sha256:80caa5bfcece4648f735b36a8fbeb394a497bfe9390d8a72575dfc934d7a4a42"
 CRICTL = "/usr/local/bin/crictl"
@@ -335,6 +336,8 @@ def record(item, ok, detail):
 
 
 def checksum_or_die():
+    if not os.path.isabs(SRC) or ".." in SRC.split("/") or not re.fullmatch(r"/[A-Za-z0-9_./-]+", SRC) or not re.fullmatch(r"[0-9a-f]{64}", EXPECTED):
+        die("源码路径或 SHA-256 参数无效")
     got = source_checksum()
     if got != EXPECTED:
         die("源码校验是 %s，期望 %s" % (got, EXPECTED))
