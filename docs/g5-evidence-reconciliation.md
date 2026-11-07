@@ -1,5 +1,7 @@
 # G5c 证据核对与补采
 
+本文保留 G5c 轮次的记录。后续同版本场景结果见 [验收总览](acceptance-overview.md#现有记录摘要)。
+
 本记录依据操作者提供的 G5c 结果整理，原始证据以控制面 `/home/lihaoyang/mini-k8s-g4/evidence/g5c/` 和 node-b `evidence-b/g5c/` 为准；本文不代替查看原始文件，也不自动判定 G5 PASS。先核对二进制、源码版本、环境、时间和对象 UID 的对应关系。采集脚本的历史固定 `BLOCKED` 不是对业务断言的测量结果。
 
 | 检查 | 已报告的测量 | 核对重点 |

@@ -1,6 +1,6 @@
 # 开发与代码阅读指南
 
-本文说明 G1 已实现部分的代码组织和维护约定。项目范围及后续阶段以 [Plan.md](../Plan.md) 为准，验收口径以 [Gateway.md](../Gateway.md) 为准。Controller、Agent 和 R1 的创建操作不在下面这张表里，分别看 [AGENT.md](../AGENT.md) 的代码地图和 [R1 详细设计](r1-reliability-design.md)。
+本文说明当前代码的主要组织和维护约定。项目范围及后续阶段以 [Plan.md](../Plan.md) 为准，验收口径以 [Gateway.md](../Gateway.md) 为准。ReplicaSet 创建操作与可靠性约束见 [R1 详细设计](r1-reliability-design.md)。
 
 ## 从哪里开始阅读
 
@@ -8,9 +8,16 @@
 | --- | --- |
 | `cmd/mini-api` | 解析启动参数，加载身份配置，连接 etcd 并启动 HTTPS 服务。 |
 | `cmd/mini-k8s` | CLI 入口，负责调用客户端并报告错误。 |
+| `cmd/mini-manager`、`cmd/mini-scheduler` | 分别启动副本控制器和调度器。 |
+| `cmd/mini-agent`、`cmd/mini-proxy` | 分别启动节点运行时对账和 Service 转发。 |
+| `cmd/g4-probe`、`cmd/g5-*-fixture` | 验收使用的探针和测试应用。 |
 | `internal/api` | 定义资源模型、资源单位及公共校验规则。 |
 | `internal/cli` | 严格解析 YAML，通过 HTTPS 调用 API，处理 apply、get、delete 和 scale。 |
-| `internal/server` | 认证和授权请求，检查字段归属，以 etcd 事务持久化资源。 |
+| `internal/server` | 认证和授权请求，检查字段归属，以 etcd 事务持久化资源与 ReplicaSet 创建操作。 |
+| `internal/controller` | 按 ReplicaSet 期望副本数对账 Pod。 |
+| `internal/scheduler` | 根据节点状态和资源预留选择节点。 |
+| `internal/agent`、`internal/runtime` | 节点状态、就绪探测及 CRI 生命周期管理。 |
+| `internal/proxy` | 计算 Service 转发并维护项目专用 iptables 规则。 |
 | `internal/acceptance` | 使用实际 API 和 etcd 进程验证阶段契约。 |
 | `scripts/acceptance` | 准备隔离测试环境、执行检查、记录证据和清理资源。 |
 
@@ -22,7 +29,7 @@
 - **List/Watch：** List 返回一致快照及版本；Watch 从该版本之后读取。订阅中断或历史不可用时，调用方需要重新 List 并重建 Watch。
 - **日志：** 记录请求身份、资源 UID、操作和结果，不记录凭据或环境变量内容。
 
-以上是 G1 的控制面契约；它们不代表容器运行、网络转发或后续阶段的故障恢复已经实现。
+这些约束需要配合相应阶段的真实环境验收，不能仅凭代码结构认定网络转发或故障恢复已经通过。
 
 ## 代码约定
 

@@ -113,15 +113,13 @@ G4-04 后恢复控制连接并确认两节点正常，再执行后续健康场�
 
 ## 8. 最轻量的执行方式与报告
 
-实现每个阶段时增加对应 Linux shell 入口，约定如下。`g1.sh`、`g2.sh` 和 `g3.sh` 已存在。`g4.sh` 目前只做无副作用预检，结果固定为 BLOCKED，不能当成 G4 PASS。仓库里没有单独的 `g5.sh`；G5 的采集脚本不判定 Gate。
+| 阶段 | 入口 | 用途 |
+| --- | --- | --- |
+| G1–G3 | [g1.sh](scripts/acceptance/g1.sh)、[g2.sh](scripts/acceptance/g2.sh)、[g3.sh](scripts/acceptance/g3.sh) | 各阶段的 Linux 验收入口。 |
+| G4 | [g4.sh](scripts/acceptance/g4.sh)、[g4-live.ps1](scripts/acceptance/g4-live.ps1) | 前者只做预检。后者在指定的双节点测试环境执行实机场景。 |
+| G5 | [g5-live.ps1](scripts/acceptance/g5-live.ps1)、[取证说明](docs/g5-service.md) | 实机场景和节点采集各有入口，采集结果需按检查项核对。 |
 
-```text
-scripts/acceptance/g1.sh
-scripts/acceptance/g2.sh
-scripts/acceptance/g3.sh
-scripts/acceptance/g4.sh
-scripts/acceptance/g5.sh
-```
+G4/G5 的 PowerShell 入口依赖既有测试机配置。运行前核对脚本中的主机、路径、权限和当前负载。各轮结果、图表与证据位置见 [验收总览](docs/acceptance-overview.md)。
 
 脚本可复用 CLI、curl、crictl 与标准 Go 测试，不要求新平台。应校验依赖、轮询断言、限制超时、输出检查 ID、保存证据，并只清理本轮创建的 UID；失败先保存现场再安全清理，清理失败必须报告，不能掩盖原错误。约定退出码 0=PASS、1=FAIL、2=BLOCKED；尚未实现则报告 NOT_RUN，不提供空脚本伪装通过。
 
