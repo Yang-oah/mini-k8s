@@ -6,20 +6,13 @@ $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $OutputEncoding = [Console]::OutputEncoding
 
-$IpA = "lihaoyang@10.128.176.165"
-$IpB = "lihaoyang@10.128.176.125"
-$KeyA = Join-Path $env:USERPROFILE ".ssh\id_ed25519"
-$KeyB = Join-Path $env:USERPROFILE ".ssh\id_rsa"
-$RemotePy = "/home/lihaoyang/mini-k8s-g4/g4_live.py"
-$SourceDir = if ($env:R1_SOURCE_DIR) { $env:R1_SOURCE_DIR } else { "/home/lihaoyang/mini-k8s-g4/evidence/r1-selector-v10-I2MJLyAh" }
-$ExpectedSha = if ($env:R1_EXPECTED_SHA) { $env:R1_EXPECTED_SHA } else { "1a8537f578953716d9c2c9858b2f2421d2ff961c1ea8212b9c3e3991e9e401a8" }
-if ($SourceDir -notmatch '^/[A-Za-z0-9_./-]+$' -or $SourceDir -match '(^|/)\.\.(/|$)' -or $ExpectedSha -cnotmatch '^[0-9a-f]{64}$') { throw "源码目录必须是安全的 Linux 绝对路径，摘要必须是 64 位小写十六进制。" }
-$RemoteEnv = "R1_SOURCE_DIR=$SourceDir R1_EXPECTED_SHA=$ExpectedSha"
+. (Join-Path $PSScriptRoot "r1-live-config.ps1")
+$RemotePy = "$RemoteHome/g4_live.py"
 
-$Agent = "/home/lihaoyang/mini-k8s-g4/bin/mini-agent.g4cur"
-$Pointer = "/home/lihaoyang/mini-k8s-g4/g4cur-evidence.path"
-$FwdFlag = "/home/lihaoyang/mini-k8s-g4/g4cur-forwarder-down"
-$RunLock = "/home/lihaoyang/mini-k8s-g4/.r1-live.lock"
+$Agent = "$RemoteHome/bin/mini-agent.g4cur"
+$Pointer = "$RemoteHome/g4cur-evidence.path"
+$FwdFlag = "$RemoteHome/g4cur-forwarder-down"
+$RunLock = "$RemoteHome/.r1-live.lock"
 $LockOwned = $false
 $Completed = $false
 $LocalPy = Join-Path $PSScriptRoot "g4_live.py"
@@ -79,7 +72,7 @@ function Read-Evidence {
 }
 
 Write-Host "G4 同一版本验收。全程大约 15 到 25 分钟，请不要关闭这个窗口。"
-Write-Host "会要四次 sudo 密码：165 让 root 进程读取新证书，125 读基线，165 换程序并跑场景，结束前 125 再对一次租约。"
+Write-Host "会要四次 sudo 密码：node-a 让 root 进程读取新证书，node-b 读基线，node-a 换程序并跑场景，结束前 node-b 再对一次租约。"
 Write-Host "脚本不停止 etcd。两台 proxy 只在开头为了读取新证书各重启一次，场景中途不再动它们。失败时会尽量把 node-b 的转发拉起来，并留下现场。"
 Write-Host ""
 
@@ -87,7 +80,7 @@ if (-not (Test-Path $LocalPy)) {
     throw "找不到 $LocalPy"
 }
 if (-not (Test-Path $KeyA) -or -not (Test-Path $KeyB)) {
-    throw "缺少 SSH 私钥。165 用 id_ed25519，125 用 id_rsa。"
+    throw "缺少配置的 SSH 私钥。"
 }
 
 try {
@@ -103,10 +96,10 @@ try {
     Invoke-Node $IpB $KeyB "env $RemoteEnv python3 -u $RemotePy precheck-b"
 
     Write-Host ""
-    Write-Host "第 1 次 sudo：10.128.176.165。只让 root 身份的 Agent 和 proxy 读取新证书，不跑场景。"
+    Write-Host "第 1 次 sudo：$IpA。只让 root 身份的 Agent 和 proxy 读取新证书，不跑场景。"
     Invoke-Node $IpA $KeyA "env $RemoteEnv python3 -u $RemotePy reload-root" -Tty
 
-    Write-Host "检查 165 上的源码和空集群"
+    Write-Host "检查 node-a 上的源码和空集群"
     Invoke-Node $IpA $KeyA "env $RemoteEnv python3 -u $RemotePy precheck"
     $Evidence = Read-Evidence
     Write-Host "证据目录 $Evidence"
@@ -116,7 +109,7 @@ try {
     Invoke-Node $IpB $KeyB "env $RemoteEnv python3 -u $RemotePy precheck-b"
 
     Write-Host ""
-    Write-Host "第 2 次 sudo：10.128.176.125。先让 proxy 读取新证书，再只读镜像、容器和 IP 租约。"
+    Write-Host "第 2 次 sudo：$IpB。先让 proxy 读取新证书，再只读镜像、容器和 IP 租约。"
     Invoke-Node $IpB $KeyB "sudo env $RemoteEnv python3 -u $RemotePy baseline-b" -Tty
     $TempJson = Join-Path $env:TEMP "g4cur-baseline-b.json"
     Copy-Between $KeyB "${IpB}:/tmp/g4cur-baseline-b.json" $TempJson
@@ -137,14 +130,14 @@ try {
     Write-Host "Agent 程序已复制到 node-b"
 
     $Watcher = Start-Job -Name g4curWatch -ScriptBlock {
-        param($KeyA, $KeyB, $IpA, $IpB, $RemotePy, $RemoteEnv)
+        param($KeyA, $KeyB, $IpA, $IpB, $RemotePy, $RemoteEnv, $RemoteHome)
         $ErrorActionPreference = "Continue"
         $optsA = @("-i", $KeyA, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-T")
         $optsB = @("-i", $KeyB, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-T")
         $seen = ""
         $log = Join-Path $env:TEMP "g4cur-watcher.log"
         while ($true) {
-            $raw = & ssh @optsA $IpA "cat /home/lihaoyang/mini-k8s-g4/g4cur-request.json 2>/dev/null || true"
+            $raw = & ssh @optsA $IpA "cat $RemoteHome/g4cur-request.json 2>/dev/null || true"
             $text = ($raw | Out-String).Trim()
             if (-not $text.StartsWith("{")) {
                 Start-Sleep -Milliseconds 300
@@ -171,18 +164,18 @@ try {
             $tmp = Join-Path $env:TEMP "g4cur-ack.json"
             $utf8 = New-Object System.Text.UTF8Encoding $false
             [System.IO.File]::WriteAllText($tmp, $ack, $utf8)
-            & scp -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new $tmp "${IpA}:/home/lihaoyang/mini-k8s-g4/g4cur-ack.tmp"
-            & ssh @optsA $IpA "mv -f /home/lihaoyang/mini-k8s-g4/g4cur-ack.tmp /home/lihaoyang/mini-k8s-g4/g4cur-ack.json"
+            & scp -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new $tmp "${IpA}:$RemoteHome/g4cur-ack.tmp"
+            & ssh @optsA $IpA "mv -f $RemoteHome/g4cur-ack.tmp $RemoteHome/g4cur-ack.json"
         }
-    } -ArgumentList $KeyA, $KeyB, $IpA, $IpB, $RemotePy, $RemoteEnv
+    } -ArgumentList $KeyA, $KeyB, $IpA, $IpB, $RemotePy, $RemoteEnv, $RemoteHome
 
     Write-Host ""
-    Write-Host "第 3 次 sudo：10.128.176.165。这次会换上新程序并跑完全部 G4 场景。"
+    Write-Host "第 3 次 sudo：$IpA。这次会换上新程序并跑完全部 G4 场景。"
     Write-Host "输入密码之后不需要再操作，直到它自己停下来。"
     Invoke-Node $IpA $KeyA "env $RemoteEnv python3 -u $RemotePy driver" -Tty
 
     Write-Host ""
-    Write-Host "第 4 次 sudo：10.128.176.125。核对租约和容器是否回到测试前。"
+    Write-Host "第 4 次 sudo：$IpB。核对租约和容器是否回到测试前。"
     Invoke-Node $IpB $KeyB "sudo env $RemoteEnv python3 -u $RemotePy final-b" -Tty
     $Final = Join-Path $env:TEMP "g4cur-final-b.json"
     Copy-Between $KeyB "${IpB}:/tmp/g4cur-final-b.json" $Final

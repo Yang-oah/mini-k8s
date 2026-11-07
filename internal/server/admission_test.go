@@ -5,9 +5,11 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"strings"
 	"testing"
 	"time"
@@ -214,4 +216,91 @@ func TestSaturatedBodyClosesOnlyHTTP1Connection(t *testing.T) {
 			t.Fatalf("HTTP/%d: status=%d Connection=%q", major, w.Code, w.Header().Get("Connection"))
 		}
 	}
+}
+
+// HTTP/2 must time out a stalled stream without exhausting recovery traffic or
+// closing the multiplexed connection.
+func TestHTTP2StalledBodyReleasesAdmission(t *testing.T) {
+	a, err := NewAdmission(1, 1, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := httptest.NewUnstartedServer(&Server{Admission: a, Credentials: Credentials{Admin: "admin", Agents: map[string]string{"node": "agent"}}})
+	s.EnableHTTP2 = true
+	s.StartTLS()
+	defer s.Close()
+	client := s.Client()
+	client.Timeout = requestBodyTimeout + 5*time.Second
+	transport := client.Transport.(*http.Transport)
+	transport.MaxConnsPerHost = 1
+	reader, writer := io.Pipe()
+	defer writer.Close()
+	request, err := http.NewRequest(http.MethodPost, s.URL+"/api/mini/v1/pods", reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Authorization", "Bearer admin")
+	initialConn := make(chan net.Conn, 1)
+	request = request.WithContext(httptrace.WithClientTrace(request.Context(), &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { initialConn <- info.Conn }}))
+	type result struct {
+		response *http.Response
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() { response, err := client.Do(request); done <- result{response, err} }()
+	if _, err := writer.Write([]byte("{")); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for len(a.regular) != 1 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(a.regular) != 1 {
+		t.Fatal("stalled stream did not acquire regular admission")
+	}
+	conn := <-initialConn
+
+	check := func(method, path, token, body string, want int) {
+		t.Helper()
+		req, err := http.NewRequest(method, s.URL+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+		gotConn := make(chan net.Conn, 1)
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { gotConn <- info.Conn }}))
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if <-gotConn != conn {
+			t.Fatal("request used a different connection instead of multiplexing HTTP/2 streams")
+		}
+		if resp.ProtoMajor != 2 || resp.StatusCode != want {
+			t.Fatalf("%s: got %s HTTP %d, want HTTP/2 %d", path, resp.Proto, resp.StatusCode, want)
+		}
+	}
+	check(http.MethodPost, "/api/mini/v1/pods", "admin", "{}", http.StatusTooManyRequests)
+	check(http.MethodPost, "/api/mini/v1/pods/p/cleanup", "agent", "{}", http.StatusBadRequest)
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("stalled HTTP/2 request failed: %v", got.err)
+		}
+		defer got.response.Body.Close()
+		if got.response.ProtoMajor != 2 || got.response.StatusCode != http.StatusBadRequest {
+			t.Fatalf("stalled stream: got %s HTTP %d", got.response.Proto, got.response.StatusCode)
+		}
+	case <-time.After(requestBodyTimeout + 3*time.Second):
+		t.Fatal("stalled HTTP/2 request did not finish")
+	}
+	deadline = time.Now().Add(time.Second)
+	for len(a.regular) != 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(a.regular) != 0 {
+		t.Fatal("stalled stream retained regular admission")
+	}
+	check(http.MethodPost, "/api/mini/v1/pods", "admin", "{", http.StatusBadRequest)
 }

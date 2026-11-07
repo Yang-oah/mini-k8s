@@ -18,7 +18,8 @@ import urllib.request
 from datetime import datetime, timezone
 
 SRC = os.environ.get("R1_SOURCE_DIR", "/home/lihaoyang/mini-k8s-g4/evidence/r1-selector-v10-I2MJLyAh")
-HOME = "/home/lihaoyang/mini-k8s-g4"
+HOME = os.environ.get("R1_REMOTE_HOME", "/home/lihaoyang/mini-k8s-g4").rstrip("/")
+API_ENDPOINT = os.environ.get("R1_API_ENDPOINT", "https://10.128.176.165:8443").rstrip("/")
 BIN = HOME + "/bin"
 LOGS = HOME + "/logs"
 EV_PTR = HOME + "/g4cur-evidence.path"
@@ -40,7 +41,7 @@ LEASES = {
 }
 ROLES = ("mini-api", "mini-manager", "mini-scheduler", "mini-agent", "mini-proxy")
 
-os.environ["PATH"] = "/home/lihaoyang/.local/go/bin:/home/lihaoyang/.local/bin:" + os.environ.get("PATH", "")
+os.environ["PATH"] = os.environ.get("R1_REMOTE_BIN_PATH", "/home/lihaoyang/.local/go/bin:/home/lihaoyang/.local/bin") + ":" + os.environ.get("PATH", "")
 os.environ["GOPROXY"] = "https://goproxy.cn,direct"
 os.environ["GOSUMDB"] = "sum.golang.google.cn"
 os.environ["GOFLAGS"] = "-mod=readonly"
@@ -400,7 +401,7 @@ def reload_root():
     if os.geteuid() == 0:
         die("请不要用 sudo 包裹整个命令")
     assert_certs()
-    say("请输入 10.128.176.165 的 sudo 密码。输入时不会显示。")
+    say("请输入 node-a 的 sudo 密码。输入时不会显示。")
     say("这一步只重启本机 root 身份的 Agent 和 proxy，让它们读取新证书。不更换程序，不停止 etcd。")
     if subprocess.run(["sudo", "-v"]).returncode != 0:
         die("sudo 没有通过，没有改动任何进程")
@@ -453,7 +454,7 @@ def readonly_precheck():
 def precheck():
     os.umask(0o077)
     if shutil.which("go") is None:
-        die("非交互 PATH 里没有 go。需要 /home/lihaoyang/.local/go/bin")
+        die("非交互 PATH 里没有 go，请检查 R1_REMOTE_BIN_PATH")
     assert_certs()
     got = checksum_or_die()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -601,7 +602,7 @@ def nodea_agent():
         die("node-a 切换不要用 root 身份直接跑整个脚本")
     role, pid, argv = one("mini-agent")
     if "-node" not in argv or argv[argv.index("-node") + 1] != "node-a":
-        die("165 上的 Agent 不是 node-a")
+        die("node-a 上的 Agent 不是 node-a")
     new = argv[:]
     new[0] = BIN + "/mini-agent.g4cur"
     stop_pid(pid, root=True)
@@ -624,7 +625,7 @@ def nodeb_agent():
         die("node-b 上没有可执行的 " + binary)
     _role, pid, argv = one("mini-agent")
     if argv[argv.index("-node") + 1] != "node-b":
-        die("125 上的 Agent 不是 node-b")
+        die("node-b 上的 Agent 不是 node-b")
     if "https://127.0.0.1:18443" not in argv:
         die("node-b 没有走本机 18443 转发，拒绝替换")
     new = argv[:]
@@ -747,8 +748,8 @@ def baseline_b():
         die("baseline-b 需要 sudo")
     _role, pid, argv = one("mini-proxy")
     flags = flag_map(argv)
-    if "https://10.128.176.165:8443" not in argv:
-        die("node-b proxy 没有连接 165 上的 API，拒绝重启")
+    if API_ENDPOINT not in argv:
+        die("node-b proxy 没有连接 node-a 上的 API，拒绝重启")
     remaining = subprocess.run(["openssl", "x509", "-in", flags["-ca-file"], "-noout", "-checkend", "21600"], capture_output=True, text=True)
     if remaining.returncode != 0:
         die("node-b 的 CA 剩余有效期不足 6 小时，没有重启 proxy")
@@ -1357,12 +1358,12 @@ def recover_forwarder():
         os.remove(FWD_FLAG)
         say("已重新拉起 node-b 转发")
     except SystemExit:
-        say("node-b 转发没有自动恢复，请在 125 上执行: python3 " + HOME + "/g4_live.py start-forwarder")
+        say("node-b 转发没有自动恢复，请在 node-b 上设置相同 R1_REMOTE_HOME 后执行: python3 " + HOME + "/g4_live.py start-forwarder")
 
 
 def driver():
     assert_certs()
-    say("请输入 10.128.176.165 的 sudo 密码。输入时不会显示。")
+    say("请输入 node-a 的 sudo 密码。输入时不会显示。")
     if subprocess.run(["sudo", "-v"]).returncode != 0:
         die("sudo 没有通过，没有改动任何进程")
     refresher = threading.Thread(target=sudo_refresh, daemon=True)
@@ -1391,7 +1392,7 @@ def driver():
         say("开始 G4-06")
         scenario_06()
         assert_guard(read_json("guard.json"))
-        say("165 上的检查已完成。接下来还要在 125 上核对租约。")
+        say("node-a 上的检查已完成。接下来还要在 node-b 上核对租约。")
     except SystemExit:
         recover_forwarder()
         say("验收中断：组件不会自动回滚。请保留证据并检查当前进程和 previous-binaries: " + ev())
