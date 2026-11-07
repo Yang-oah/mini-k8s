@@ -1,6 +1,6 @@
 # R2 实施与验收计划
 
-R1 已合并到 `master`（`77f47f1`）。R2 按下面的顺序拆分。每步保留独立的验收记录，再进入依赖它的下一步。
+R1 已合并到 `master`（`77f47f1`）。R2-A1 已通过验收并提交 [PR #9](https://github.com/Yang-oah/mini-k8s/pull/9)。A2、B、C 待实施，每步有独立验收记录。最终验收使用的提交和原始记录见 [验收结果与证据](mini-k8s-验收结果与证据.md)。
 
 | 步骤 | 实现 | 验收 |
 | --- | --- | --- |
@@ -52,3 +52,9 @@ Windows 本地套件中的既有超时测试遇到本地 socket 连接权限限�
 最终 review 发现认证失败路径的请求体仍可阻塞 HTTP/1 响应：无效凭据请求不会进入预算和读取期限，net/http 可等待未完成的请求体。测试机真实 HTTPS 上等待 12 秒仍未收到 401，关闭连接后结束。
 
 已修复该路径：对带未读请求体的 HTTP/1 认证失败响应关闭连接。修复前的真实 TLS 回归测试复现超时，修复后连续三轮通过；HTTP/2 响应头的单元测试也通过。新源码摘要为 `d00176748243038f90c357b8c217ad3066fc8d78bb80b835b2439a08982870da`，新快照的 G1/G2、Go 测试、静态检查及构建通过，证据为 `/home/lihaoyang/mini-k8s-g4/evidence/r2-auth-fix-BFWn7Gmx/final/artifacts/acceptance/20261106T091619Z-g2-1910007/`。上文 G3～G5 与双节点过载证据仍对应修复前的 `5802e862...` 快照；本次只改变未认证 HTTP/1 带请求体的响应处理，相关路径已单独回归，新快照尚无 G3～G5 同版本记录。
+
+随后补充了真实 TLS HTTP/2 慢请求体回归。源码摘要 `b336e1c50cc7b2becc3520b6014c309c29b48d166dbc02664baaa9de4e930e82` 的测试在 Linux 上开启 race 检测连续通过三轮。占满普通额度时，另一条普通请求返回 429，Agent 清理请求进入处理器并完成参数校验。慢请求在约 10 秒后结束并释放额度，后续普通请求复用原 HTTP/2 连接。该专项覆盖清理请求准入，实际心跳与 CRI 清理仍由双节点过载场景取证。
+
+同一快照的 G1/G2、格式检查、Go 测试、静态检查、构建和清理通过。证据根目录为 `/home/lihaoyang/mini-k8s-g4/evidence/r2-a1-terra-final-uZp8BtGx/`，见 `http2-race.log` 和 `artifacts/acceptance/20261106T102437Z-g2-2508512/G2.md`。G3 通过，证据见 `artifacts/acceptance/20261106T134228Z-g3-4126211/`；G4 通过，证据为 `/home/lihaoyang/mini-k8s-g4/evidence/g4cur-20261106T134648Z/`。双节点过载探针通过，证据见 `r2-a1-live-66ffa511d866/result.json`。
+
+G5 预检首次因旧应答文件遗留而停止，修复验收脚本并归档旧应答后单独重跑。G5-01～07 通过，证据为 `/home/lihaoyang/mini-k8s-g4/evidence/g5cur-20261107T121441Z/`；其预检摘要与上述快照一致，G4 构建清单指向上述 G4 证据，运行锁已释放。该源码摘要覆盖 `cmd`、`internal` 和 Go 模块文件，验收脚本的修复需随交付一并审阅。
