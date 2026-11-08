@@ -21,6 +21,23 @@ flowchart LR
 
 图里的 Agent 和 Proxy 在两台 Worker 上各运行一份。API Server 读写 etcd，Controller 比较声明的副本数和实际实例数，Scheduler 负责放置，Agent 通过 CRI 让 containerd 执行。Proxy 读到 Service、节点和 Pod 状态后更新 iptables，图中的业务请求由内核规则转发。选择 Go、etcd、containerd 和现有 CNI 插件，是为了把实现集中在这些组件如何交换状态。 [Kubernetes 组件说明](https://kubernetes.io/docs/concepts/overview/components/)
 
+## 和 Kubernetes 相比，首版做到哪里
+
+我把首版范围定在一条能用真实环境验收的链路。从提交声明开始，一路验证副本对账、调度、容器运行、服务访问和资源清理。首版固定一套控制面、两台 Worker 和无状态应用，这样能在两台机器上单独断开控制连接、暂停 etcd，再核对每个组件看到的状态。范围来自 [首版实施计划](../Plan.md#1-范围与实施原则) 和 [项目需求](../PRD.md)。
+
+| 领域 | Mini K8s 已实现 | 首版暂缓的能力及原因 |
+| --- | --- | --- |
+| API 与权限 | 自定义 API 和 `mini` CLI，支持资源读写、List / Watch、版本校验、TLS 和组件身份授权 | 首版只使用 `default` 命名空间。Kubernetes API 和 `kubectl` 兼容、多租户和通用 RBAC 需要另行定义资源语义及权限边界 |
+| 工作负载与调度 | 无状态单容器 Pod、ReplicaSet 手动伸缩、按 CPU 和内存请求放置，绑定与预留一起提交 | Deployment 滚动发布和回滚会引入多代 ReplicaSet。Job、StatefulSet 和自动扩缩容也各有自己的控制规则，首版先验收一个副本控制循环。 [Kubernetes Deployment](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/) |
+| 容器与存储 | Agent 通过 containerd CRI 创建、重启和清理容器，CNI 负责 Pod 网络 | 多容器和 Init Container 涉及 Pod 内多个容器的启动、就绪和失败顺序。PV 和 PVC 还要验证卷绑定、挂载和故障后的数据保留。首版选择可重建的无状态负载。 [Kubernetes 持久卷](https://kubernetes.io/docs/concepts/storage/persistent-volumes/) |
+| 网络与服务 | 两节点 Pod 互通，单 TCP 端口 ClusterIP，按节点和 Pod 的就绪状态更新 iptables | DNS、Ingress、NodePort、LoadBalancer 和 NetworkPolicy 各有独立的接入或隔离要求。用固定拓扑和 ClusterIP 就能测出就绪变化、节点失联和跨节点回程。 [Kubernetes 服务与网络](https://kubernetes.io/docs/concepts/services-networking/) |
+
+### 现有链路还需要补什么
+
+- **负载和缓存。** R2-A1 已验证普通 API 请求过载时，Agent 心跳和清理还能进入。接下来测量并约束 API Server 对 etcd 的在途 RPC，再实现有界对账队列和 List / Watch 缓存。缓存上线前要验证断线重建和最终收敛。 [R2 实施与验收计划](r2-implementation-plan.md)
+- **节点恢复。** 节点标记为 Unknown 后，调度器停止向它绑定新 Pod，Proxy 摘除它的 Service 端点，尚未确认停止的旧实例仍计入副本。要安全补建，需要先确认旧节点已隔离，再用节点会话代次拒绝旧 Agent 写入。这两件事分别解决进程仍可能运行和旧状态仍可能上报的问题。 [R3 节点会话与隔离恢复](reliability-roadmap.md#r3节点会话与隔离恢复)
+- **运维恢复与高可用。** 当前部署为单控制面、单成员 etcd。先把快照恢复、审计补偿和关键告警做成可验收的故障演练。若以后增加控制器实例，还要设计领导租约和写入校验，防止切换时两个控制器同时提交。 [可靠性路线图](reliability-roadmap.md)
+
 ## 实现过程中学到的三个问题
 
 ### 1. 创建请求超时后，应该重试什么
@@ -63,4 +80,4 @@ R2-A1 为普通 API、Watch 和节点恢复请求分别设在途上限。普通�
 
 ## 当前做到哪里
 
-G1～G5 覆盖控制面、副本控制、单节点运行、双节点调度和 Service。R1 的幂等与并发改进已合并，R2-A1 已完成验收并交由 PR #9 审阅。当前验证范围是一套控制面、单成员 etcd 和两台 Linux Worker，20 Pod 是这套环境下的功能验收样本。下一阶段先测量并约束 API Server 对 etcd 的在途请求，再做控制器队列和 List / Watch 缓存。 [可靠性路线图](reliability-roadmap.md) · [R2-A1 PR #9](https://github.com/Yang-oah/mini-k8s/pull/9)
+G1～G5 覆盖首版演示范围，20 Pod 是这套环境下的功能验收样本。R1 的幂等与并发改进已合并，R2-A1 已完成验收并交由 PR #9 审阅。节点会话、完整审计等原 PRD 要求仍需单独验收。 [项目需求](../PRD.md) · [R2-A1 PR #9](https://github.com/Yang-oah/mini-k8s/pull/9)
