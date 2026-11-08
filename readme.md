@@ -80,7 +80,7 @@ sequenceDiagram
     end
 ```
 
-部署过程中，Pod 绑定和 CPU、内存预留在同一个 etcd 事务中提交。节点失联时，调度器停止向它绑定新 Pod，Proxy 摘除它的端点，Controller 继续计入尚未确认停止的旧实例。 [双节点调度](docs/g4.md) · [Service 设计](docs/g5-service.md)
+部署过程中，Pod 绑定和 CPU、内存预留在同一个 etcd 事务中提交。节点失联时，调度器停止向它绑定新 Pod，Proxy 摘除它的端点，Controller 继续计入尚未确认停止的旧实例。
 
 ## 从哪里读代码
 
@@ -97,8 +97,19 @@ sequenceDiagram
 
 ## 构建与验收
 
-在仓库根目录用 Go 1.23 或更高版本运行 `go build ./...`。本地开发检查见 [开发指南](docs/development.md)。运行双节点演示需要 etcd、Linux Worker、containerd 和 CNI，配置与启动命令见 [两节点运行与排障指南](docs/operations.md)。
+在仓库根目录用 Go 1.23 或更高版本运行 `go build ./...`。运行双节点演示需要 etcd、Linux Worker、containerd 和 CNI，配置与启动命令见 [两节点运行与排障指南](docs/operations.md)。
 
-G1～G5 已通过。最近一轮双节点验收中，20 个 Pod 用时 7.3 秒全部 Ready，稳定运行 5 分钟后完成缩容和清理。R2-A1 的过载验证也已通过，普通 API 请求返回 429 时，两台 Agent 仍能上报心跳并完成测试 Pod 清理。 [验收标准](Gateway.md) · [验收结果与证据](docs/mini-k8s-验收结果与证据.md) · [验收脚本](scripts/acceptance)
+G1～G5 已通过。最近一轮双节点验收中，20 个 Pod 用时 7.3 秒全部 Ready，稳定运行 5 分钟后完成缩容和清理。R2-A1 的过载验证也已通过，普通 API 请求返回 429 时，两台 Agent 仍能上报心跳并完成测试 Pod 清理。
 
-项目范围和阶段顺序见 [PRD](PRD.md) 与 [Plan](Plan.md)。幂等设计和后续工作见 [R1 设计](docs/r1-reliability-design.md)、[R2 计划](docs/r2-implementation-plan.md) 和 [可靠性路线图](docs/reliability-roadmap.md)。
+## 文档索引
+
+| 想查什么 | 文档 |
+| --- | --- |
+| 项目范围、阶段计划和设计取舍 | [PRD](PRD.md) · [实施计划](Plan.md) · [项目汇报](docs/mini-k8s-管理层汇报.md) |
+| 运行和排障 | [G1 本地启动](docs/g1.md) · [两节点运行与排障](docs/operations.md) |
+| 代码约定和修改前检查 | [开发指南](docs/development.md) · [仓库 Agent 工作说明](AGENT.md) |
+| 副本对账、容器运行和节点调度 | [G2 副本控制器](docs/g2.md) · [G3 Agent 与运行时](docs/g3.md) · [G4 双节点调度](docs/g4.md) |
+| Service 和就绪探测 | [G5 TCP 就绪探测](docs/g5-readiness.md) · [G5 Service](docs/g5-service.md) |
+| 验收条件、执行入口和证据 | [验收标准](Gateway.md) · [验收脚本](scripts/acceptance) · [本轮验收结果与证据](docs/mini-k8s-验收结果与证据.md) · [早期 G5 证据核对](docs/g5-evidence-reconciliation.md) |
+| R1 幂等与容量采样 | [R1 设计与验收](docs/r1-reliability-design.md) · [只读基线采集](docs/r1-baseline.md) · [只读采样记录](docs/r1-baseline-results.md) |
+| R2 过载保护和后续工作 | [R2 实施与验收](docs/r2-implementation-plan.md) · [可靠性路线图](docs/reliability-roadmap.md) |
