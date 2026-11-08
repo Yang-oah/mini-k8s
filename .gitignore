@@ -1,0 +1,3 @@
+# Python 验收辅助脚本运行时产生的缓存。
+__pycache__/
+*.py[cod]

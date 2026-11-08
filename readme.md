@@ -97,9 +97,20 @@ sequenceDiagram
 
 ## 构建与验收
 
-在仓库根目录用 Go 1.23 或更高版本运行 `go build ./...`。运行双节点演示需要 etcd、Linux Worker、containerd 和 CNI，配置与启动命令见 [两节点运行与排障指南](docs/operations.md)。
+用 Go 1.23 或更高版本在仓库根目录构建和检查。
+
+```sh
+gofmt -l cmd internal
+go vet ./...
+go test ./...
+go build ./...
+```
+
+运行双节点演示时，先准备 etcd、两台 Linux Worker、containerd、CNI 和双向路由，再按手册启动组件、部署示例、访问 ClusterIP，最后缩容和清理。验收前确认脚本指向独立测试环境。 [两节点运行与排障指南](docs/operations.md)
 
 G1～G5 已通过。最近一轮双节点验收中，20 个 Pod 用时 7.3 秒全部 Ready，稳定运行 5 分钟后完成缩容和清理。R2-A1 的过载验证也已通过，普通 API 请求返回 429 时，两台 Agent 仍能上报心跳并完成测试 Pod 清理。
+
+Service 删除后会保留 ClusterIP 声明，避免失联 Proxy 的旧规则命中复用地址。长期反复创建和删除 Service 可能耗尽地址池。 [Service 设计](docs/g5-service.md)
 
 ## 文档索引
 
@@ -110,6 +121,7 @@ G1～G5 已通过。最近一轮双节点验收中，20 个 Pod 用时 7.3 秒�
 | 代码约定和修改前检查 | [开发指南](docs/development.md) · [仓库 Agent 工作说明](AGENT.md) |
 | 副本对账、容器运行和节点调度 | [G2 副本控制器](docs/g2.md) · [G3 Agent 与运行时](docs/g3.md) · [G4 双节点调度](docs/g4.md) |
 | Service 和就绪探测 | [G5 TCP 就绪探测](docs/g5-readiness.md) · [G5 Service](docs/g5-service.md) |
-| 验收条件、执行入口和证据 | [验收标准](Gateway.md) · [验收脚本](scripts/acceptance) · [本轮验收结果与证据](docs/mini-k8s-验收结果与证据.md) · [早期 G5 证据核对](docs/g5-evidence-reconciliation.md) |
+| 验收条件与执行入口 | [验收标准](Gateway.md) · [验收脚本](scripts/acceptance) |
+| 验收结果与历史记录 | [本轮验收结果与证据](docs/mini-k8s-验收结果与证据.md) · [阶段验收总览与历史图表](docs/acceptance-overview.md) · [早期 G5 证据核对](docs/g5-evidence-reconciliation.md) |
 | R1 幂等与容量采样 | [R1 设计与验收](docs/r1-reliability-design.md) · [只读基线采集](docs/r1-baseline.md) · [只读采样记录](docs/r1-baseline-results.md) |
 | R2 过载保护和后续工作 | [R2 实施与验收](docs/r2-implementation-plan.md) · [可靠性路线图](docs/reliability-roadmap.md) |

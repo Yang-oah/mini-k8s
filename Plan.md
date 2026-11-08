@@ -1,6 +1,6 @@
 # Mini K8s 实现计划
 
-状态：demo 实施基线，尚未执行验收  
+状态：demo 实施基线。各版本的验收结果见 [Gateway 第 9 节](Gateway.md#9-当前状态)。
 目标：用尽量少的组件跑通声明式容器编排，展示 API、Controller、Scheduler、Agent 与 Service 的协作。  
 相关文档：[PRD](PRD.md) · [阶段验收 Gateway](Gateway.md)
 
@@ -137,4 +137,4 @@ G5 验收收尾及上述可靠性扩展的建议实施顺序、依赖与验收�
 
 先准备 Linux 测试节点、containerd/CNI、可获取的固定镜像与不重叠网段。开发按 G1→G5 推进，每阶段实现对应检查脚本；已有 Go 代码时执行 gofmt、go vet、go test 和构建。初期单条命令/脚本加 Markdown 报告即可，不搭建额外测试平台。
 
-仓库已有 G1–G5 相关实现和验收辅助脚本；各次运行的结果以对应版本的实际验收记录为准。G5c 的功能测量和当前待核对事项见 [G5c 证据核对](docs/g5-evidence-reconciliation.md)，不能仅凭脚本存在或采集成功宣称整门通过。
+仓库已有 G1–G5 的实现和验收脚本。各轮结果按受测源码版本记录，验收场景、实测数据及证据入口见 [验收总览](docs/acceptance-overview.md)。
