@@ -1,8 +1,8 @@
 # R1 详细设计：容量基线与 RS 创建幂等
 
-状态：实现与验证进行中，尚未通过完整 R1 验收。本文细化 [可靠性规划](reliability-roadmap.md) 的 R1；G5 结果和已有 Gate 的最终判定以各自验收记录为准。
+状态：R1 已通过 [PR #8](https://github.com/Yang-oah/mini-k8s/pull/8) 合并到 `master`（`77f47f1`）。合并范围的同版本 G1～G5、并发与故障评测通过。基线指标和后续运维边界见第 8 节。本文细化 [可靠性规划](reliability-roadmap.md) 的 R1。
 
-当前工作区已实现创建操作的准备、提交、查询、取消，以及显式管理员回收的初版。准备请求以 RS UID、版本、Pod 名称与 Pod 列表版本构造持久化身份；提交在同一事务写入 Pod 和结果。Controller 不再使用原始 `POST /pods` 创建 RS 子 Pod。旧 Controller 与新版 API 不兼容，应先停止旧 Controller，再升级 API 和 Controller，并以新版本做回归验证。
+已合并的实现支持创建操作的准备、提交、查询、取消和显式管理员回收。准备请求以 RS UID、版本、Pod 名称与 Pod 列表版本构造持久化身份。提交在同一事务写入 Pod 和结果。Controller 通过创建操作接口创建 RS 子 Pod。旧 Controller 与新版 API 不兼容，应先停止旧 Controller，再升级 API 和 Controller，并以新版本做回归验证。
 
 **目前仍有边界：** 回收需管理员显式调用，尚无自动发现或周期回收；已有旧 schema 操作记录时新建意图会保守拒绝，尚无迁移工具，因此无人维护时全局配额仍可能耗尽。已删除 RS 的记录清理完后可显式回收其 UID 元数据并释放预算。回收前按同一个 etcd revision 分页检查 ReplicaSet 和 Pod，两类对象共用 2048 的扫描预算，每页最多 32 个；发现该 UID 仍被引用，或对象数超过预算，都返回冲突，不跳过检查。操作记录回收前，终态写入时间以及 API 进程首次观察到该终态之后的单调时间，都要超过 24 小时加 10 秒；API 重启会重新开始观察。etcd 离线恢复后必须重启 API，再按该规则重新观察。未经完整验证不得将这些限制视为已解决。
 
@@ -93,11 +93,11 @@ R1 只改 Controller 管理的 RS 子 Pod 创建路径和相关容量观测。�
 
 全部操作记录回收后，可由管理员调用 `POST /api/mini/v1/replicasets/<名称>/create-operation-owner-gc`，请求体为 `{"uid":"<旧 RS UID>"}`。服务端核对该 UID 已无 RS、Pod、未决操作及历史记录后，原子回收该 UID 的元数据并释放预算；同名新 RS 使用独立 UID。检查使用固定的 etcd revision 分页，每页最多 32 个对象，两类对象共用 2048 个的扫描预算；超出预算或快照不可用时保守拒绝，不得跳过检查强行删除。
 
-- `PREPARED` 不因普通 TTL 自动删除；不可确认的操作保持待核实并告警。对可确定取消的意图先完成 CAS 终态化。
+- `PREPARED` 不因普通 TTL 自动删除。不可确认的操作保持待核实。对可确定取消的意图先完成 CAS 终态化。未决操作和配额水位的独立告警列入 R4 运维观测。
 - `COMMITTED` 至少保留到关联 Pod 已回收且超过保留窗口；`CANCELLED` 至少保留到相同窗口结束。当前代码把这个窗口定为 24 小时加 10 秒，并把单个 RS UID 的操作键用量上限定为 10000、全局上限定为 100000。这两个上限是拒绝新意图的实现阈值，不是压测得到的容量。
 - 同一 RS UID 保留可持久化的单调序号高水位及已回收的连续终态水位；清除详细结果后，对旧序号返回明确“结果已过期”，禁止将其当成新意图执行。水位推进和记录删除需要 CAS，遇到未决/未满足保留期的空洞不能越过。
 - RS 删除后不得让旧 UID 分配新意图；只有确认该 UID 无未决意图且所有保留期已结束，才可回收其详细记录及水位。此后旧 UID 的请求返回不存在或过期，不能根据同名新 RS 补建。UID 不复用是该方案的前提。
-- 设置总记录数/磁盘告警和有界清理批次；达到安全上限且无法回收时拒绝新的创建意图并告警，保留现有容器，不能静默删除未决记录。etcd 故障或磁盘满期间的具体故障码和恢复流程需验证。
+- 操作记录按有界批次回收。配额耗尽时，API 对需要新增记录的请求返回 503，现有容器与未决记录保留。记录配额水位、磁盘告警及磁盘写满后的恢复演练列入 R4。R1 已验证的故障范围见第 8 节。
 
 ## 7. 容量基线
 
@@ -126,7 +126,7 @@ R1 只改 Controller 管理的 RS 子 Pod 创建路径和相关容量观测。�
 - **R1-A：基线已补采，存在指标缺口。** 当前版本的 20/40 个零副本 RS、1/8/32 客户端六档均完成；首次创建均为 201，读取均为 200。原始 etcd 指标、Watch 数、进程 CPU/内存、磁盘采样与资源限制记录保存在 `/home/lihaoyang/mini-k8s-g4/evidence/r1-selector-v10-I2MJLyAh/r1-capacity-current-xh5jxzts/`。本轮没有 Watch 负载，Watcher 仅为瞬时值；etcd 未暴露 `grpc_server_handling_seconds` 请求耗时直方图，因此不能声称已获得 etcd 请求延迟分布。规划没有指定持续压测分钟数或最低吞吐门槛，不因此新增硬性通过条件。
 - **设计限制：持续保留。** 当前是单 Controller、单成员 etcd；操作记录回收需管理员显式调用，旧 schema 暂无迁移工具；缓存与全局并发控制在后续阶段。记录数／磁盘独立告警尚未确认实现，当前仅确认配额耗尽返回 503。上述限制不因 G1～G5 通过而消失，不能将其描述为已经实现。
 
-**集中评测记录：** 复核上述源码摘要后，使用独立 etcd 重跑 Server/Controller race 测试通过（Service 地址测试因独占空 etcd 的前提而单独重跑通过）；提交与取消竞争、真实 HTTP 响应丢失及 PREPARED 进程故障测试通过。证据分别位于 `r1-selector-v10-I2MJLyAh/r1-evaluation-IUIbvU8z/`、`r1-selector-v10-I2MJLyAh/r1-service-evaluation-43Bad37b/`、`r1-selector-v10-I2MJLyAh/r1-faults-ZzzfksO8/` 和 `r1-selector-v10-I2MJLyAh/r1-process-faults-2aE6I6Ul/`，均相对于 `/home/lihaoyang/mini-k8s-g4/evidence/`。详细设计提及记录数和磁盘告警，路线图将磁盘水位告警列入 R4；当前代码仅确认配额耗尽返回 503，普通错误日志不能当作独立告警。
+**集中评测记录：** 复核上述源码摘要后，使用独立 etcd 重跑 Server/Controller race 测试通过（Service 地址测试因独占空 etcd 的前提而单独重跑通过）；提交与取消竞争、真实 HTTP 响应丢失及 PREPARED 进程故障测试通过。证据分别位于 `r1-selector-v10-I2MJLyAh/r1-evaluation-IUIbvU8z/`、`r1-selector-v10-I2MJLyAh/r1-service-evaluation-43Bad37b/`、`r1-selector-v10-I2MJLyAh/r1-faults-ZzzfksO8/` 和 `r1-selector-v10-I2MJLyAh/r1-process-faults-2aE6I6Ul/`，均相对于 `/home/lihaoyang/mini-k8s-g4/evidence/`。配额耗尽返回 503 已确认，独立阈值告警仍待 R4 实现。
 
 ## 9. 已知风险与尚未关闭的决定
 

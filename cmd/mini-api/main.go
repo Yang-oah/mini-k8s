@@ -22,7 +22,15 @@ func main() {
 	key := flag.String("tls-key", "", "server private key PEM")
 	auth := flag.String("auth-file", "", "JSON identity credentials file")
 	serviceCIDR := flag.String("service-cidr", "", "IPv4 CIDR for Service addresses (must not overlap Pod or host networks)")
+	regularLimit := flag.Int("max-inflight", 64, "maximum concurrent ordinary API requests")
+	watchLimit := flag.Int("max-watches", 32, "maximum concurrent watch requests")
+	recoveryLimit := flag.Int("max-recovery-inflight", 16, "maximum concurrent agent recovery requests")
+	watchWriteTimeout := flag.Duration("watch-write-timeout", 2*time.Second, "deadline for each watch write")
 	flag.Parse()
+	admission, err := server.NewAdmission(*regularLimit, *watchLimit, *recoveryLimit, *watchWriteTimeout)
+	if err != nil {
+		log.Fatal(err)
+	}
 	if err := server.ValidateServiceCIDR(*serviceCIDR); err != nil {
 		log.Fatalf("invalid service-cidr: %v", err)
 	}
@@ -48,7 +56,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer client.Close()
-	apiServer := &server.Server{Client: client, Credentials: credentials, ServiceCIDR: *serviceCIDR}
+	apiServer := &server.Server{Client: client, Credentials: credentials, ServiceCIDR: *serviceCIDR, Admission: admission}
 	monitorCtx, cancelMonitor := context.WithCancel(context.Background())
 	defer cancelMonitor()
 	go apiServer.RunNodeHealthMonitor(monitorCtx)

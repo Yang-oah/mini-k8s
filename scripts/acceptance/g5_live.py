@@ -16,8 +16,9 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-SRC = "/home/lihaoyang/mini-k8s-g4/evidence/r1-selector-v10-I2MJLyAh"
-HOME = "/home/lihaoyang/mini-k8s-g4"
+SRC = os.environ.get("R1_SOURCE_DIR", "/home/lihaoyang/mini-k8s-g4/evidence/r1-selector-v10-I2MJLyAh")
+HOME = os.environ.get("R1_REMOTE_HOME", "/home/lihaoyang/mini-k8s-g4").rstrip("/")
+API_ENDPOINT = os.environ.get("R1_API_ENDPOINT", "https://10.128.176.165:8443").rstrip("/")
 BIN = HOME + "/bin"
 LOGS = HOME + "/logs"
 EV_PTR = HOME + "/g5cur-evidence.path"
@@ -29,7 +30,7 @@ ETCD_ARGV = HOME + "/g5cur-etcd.json"
 ROOT_REQ = HOME + "/g5cur-root-req.json"
 ROOT_ACK = HOME + "/g5cur-root-ack.json"
 ROOT_STOP = HOME + "/g5cur-root.stop"
-EXPECTED = "1a8537f578953716d9c2c9858b2f2421d2ff961c1ea8212b9c3e3991e9e401a8"
+EXPECTED = os.environ.get("R1_EXPECTED_SHA", "1a8537f578953716d9c2c9858b2f2421d2ff961c1ea8212b9c3e3991e9e401a8")
 SERVICE_IMAGE = "docker.io/library/g5-service@sha256:5c28668e30e46b6f74a6ce67eed386d1d00df09ed65a6018166b2e03f26a4236"
 PROBE_IMAGE = "docker.io/library/g4-probe@sha256:80caa5bfcece4648f735b36a8fbeb394a497bfe9390d8a72575dfc934d7a4a42"
 CRICTL = "/usr/local/bin/crictl"
@@ -48,7 +49,7 @@ LEASES = {
 ROLES = ("mini-api", "mini-manager", "mini-scheduler", "mini-agent", "mini-proxy")
 HOLD = 300
 
-os.environ["PATH"] = "/home/lihaoyang/.local/go/bin:/home/lihaoyang/.local/bin:" + os.environ.get("PATH", "")
+os.environ["PATH"] = os.environ.get("R1_REMOTE_BIN_PATH", "/home/lihaoyang/.local/go/bin:/home/lihaoyang/.local/bin") + ":" + os.environ.get("PATH", "")
 os.environ["GOPROXY"] = "https://goproxy.cn,direct"
 os.environ["GOSUMDB"] = "sum.golang.google.cn"
 os.environ["GOFLAGS"] = "-mod=readonly"
@@ -153,6 +154,8 @@ def source_checksum():
 
 
 def checksum_or_die():
+    if not os.path.isabs(SRC) or ".." in SRC.split("/") or not re.fullmatch(r"/[A-Za-z0-9_./-]+", SRC) or not re.fullmatch(r"[0-9a-f]{64}", EXPECTED):
+        die("源码路径或 SHA-256 参数无效")
     got = source_checksum()
     if got != EXPECTED:
         die("源码校验是 %s，期望 %s" % (got, EXPECTED))
@@ -473,10 +476,12 @@ def ask_b(action, data=None, timeout=120):
                     os.remove(REQ)
                 if not ack.get("ok"):
                     die("node-b %s 失败: %s" % (action, str(ack.get("output", ""))[-500:]))
-                for line in (ack.get("output") or "").splitlines():
+                output = ack.get("output") or ""
+                os.remove(ACK)
+                for line in output.splitlines():
                     if line.startswith("G4RESULT "):
                         return json.loads(line[len("G4RESULT "):])
-                return {"ok": True, "output": ack.get("output") or ""}
+                return {"ok": True, "output": output}
         time.sleep(0.3)
     die("node-b 没有在 %d 秒内完成 %s" % (timeout, action))
 
@@ -749,8 +754,8 @@ def finalize_proxy():
 
 def swap_proxy():
     _role, pid, argv = one("mini-proxy")
-    if "https://10.128.176.165:8443" not in argv:
-        die("proxy 没有连接 165 的 API")
+    if API_ENDPOINT not in argv:
+        die("proxy 没有连接 node-a 的 API")
     if not os.path.isfile(PROXY_BIN):
         die("没有 " + PROXY_BIN)
     if os.path.exists(PROXY_RECOVERY):
@@ -1663,7 +1668,7 @@ def sudo_refresh():
 def driver():
     assert_certs()
     checksum_or_die()
-    say("请输入 10.128.176.165 的 sudo 密码。输入时不会显示。")
+    say("请输入 node-a 的 sudo 密码。输入时不会显示。")
     if subprocess.run(["sudo", "-v"]).returncode != 0:
         die("sudo 没有通过")
     refresher = threading.Thread(target=sudo_refresh, daemon=True)
@@ -1684,7 +1689,7 @@ def driver():
         scenario_05(cluster_ip)
         service = scenario_06()
         scenario_07(service)
-        say("165 上的 G5 场景已跑完。")
+        say("node-a 上的 G5 场景已跑完。")
     except SystemExit:
         recover_etcd()
         recover_forwarder()

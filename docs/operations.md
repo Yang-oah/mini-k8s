@@ -127,6 +127,31 @@ sudo "$G5_PROXY" -server "$G5_API" -ca-file "$G5_CA_FILE" \
 
 以上前台进程在终端退出时会受影响；生产式托管不在本演示范围内。两侧的状态目录分别留在本机，权限须满足程序要求。不要删除或复用 Proxy 所有权文件；Proxy 退出不会自动移除已安装规则。启动后在控制面 `mini get nodes`，确认两节点 Ready 和心跳；查看各进程日志并核对证书、身份和 CRI。节点就绪不代表完整验收通过。
 
+## 双 Worker 复现核对
+
+以下是现场操作清单，尚未在本文所述的占用中集群上重新执行 Worker 启动。每次使用独立测试环境，先记录源码提交和源码摘要、二进制构建来源、两机架构、containerd/CNI 版本、时间和配置；不可用旧版本的验收结果替代本次结果。
+
+1. 两台机器分别核对节点名、专属令牌、CRI endpoint、CNI 配置及实际 PodCIDR，验证到控制面 HTTPS 的证书与连通性，以及到对端 PodCIDR 的路由。确认镜像 digest 在两台均可用，记录原有 CRI、租约、资源预留和规则基线。
+2. 控制面注册匹配的两个 Node，分别在各 Worker 启动对应 Agent 和 Proxy，记录进程身份与日志。确认两节点心跳、状态和 API 中的 PodCIDR；发生冲突或权限不足时停止并记录 `BLOCKED`，不要复用正在使用的状态目录或规则链。
+3. 按下一节提交测试资源并记录 UID；确认各 Pod 的节点、CRI 身份和 Ready 状态，再从两侧宿主机和 Pod 分别建立新连接，核对目标实例。完整检查及故障注入按 [G4](g4.md) 和 [G5](g5-service.md) 执行，并记录每项操作、时间、结果与证据。
+4. 按下节仅清理本轮资源，对照两侧基线核对 CRI、租约、预留和规则；保留日志、退出状态及清理结果。检查未执行或证据不足记为 `BLOCKED`，断言失败记为 `FAIL`，不能由节点 Ready 推断整体通过。
+
+已按上述步骤配置验收环境时，可在 Windows 工作区一次启动 G1～G5。先把同一份源码放到 node-a，使用 Linux 计算摘要：
+
+```bash
+{ find cmd internal -type f -print0 | sort -z | xargs -0 sha256sum; sha256sum go.mod go.sum; } | sha256sum
+```
+
+```powershell
+$env:R1_SOURCE_DIR = '/path/to/source-snapshot'
+$env:R1_EXPECTED_SHA = '<上一步输出的 64 位摘要>'
+pwsh -File .\scripts\acceptance\run-live-gates.ps1
+```
+
+连接参数见 [共用配置](../scripts/acceptance/r1-live-config.ps1)。两侧 SSH 主机密钥需事先核对，运行中仍要在终端按提示输入 sudo 密码。入口先执行包含 G1/G2 的 G3，再依次执行 G4 和 G5，核对新证据的摘要、场景判定和运行锁。某关失败即停止，末尾的 `Summary` 是本机 JSON 汇总。排查后可用相同的配置单独运行对应入口，保留原始证据。该入口沿用现有验收集群的节点名、CRI/CNI 和故障注入约定。
+
+验收 R2-A1 时加 `-IncludeR2A1`。它在 G4 通过后、G5 开始前对当前 API 执行过载探针，观察 429 窗口内两台 Agent 的心跳和测试 Pod 的清理，并把结果及证据路径写入同一份汇总。
+
 ## 20 Pod 和 Service 示例
 
 [g5-replicaset.yaml](../examples/g5-replicaset.yaml) 使用 G5 要求的 20 副本、每 Pod requests 50m/64Mi 与 limits 100m/128Mi；[g5-service.yaml](../examples/g5-service.yaml) 按标签选择它们并将 TCP 8080 转发到目标 8080。ClusterIP 由 API 分配，不要在清单中填写。两个清单的名称和 `app` 标签必须保持一致，并保证测试名称和 selector 不与现有 RS 冲突。

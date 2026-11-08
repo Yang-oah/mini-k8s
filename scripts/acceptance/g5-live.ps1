@@ -6,12 +6,9 @@ $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $OutputEncoding = [Console]::OutputEncoding
 
-$IpA = "lihaoyang@10.128.176.165"
-$IpB = "lihaoyang@10.128.176.125"
-$KeyA = Join-Path $env:USERPROFILE ".ssh\id_ed25519"
-$KeyB = Join-Path $env:USERPROFILE ".ssh\id_rsa"
-$RemotePy = "/home/lihaoyang/mini-k8s-g4/g5_live.py"
-$RemoteHome = "/home/lihaoyang/mini-k8s-g4"
+. (Join-Path $PSScriptRoot "r1-live-config.ps1")
+$RemotePy = "$RemoteHome/g5_live.py"
+
 $Bin = "$RemoteHome/bin"
 $Pointer = "$RemoteHome/g5cur-evidence.path"
 $FwdFlag = "$RemoteHome/g5cur-forwarder-down"
@@ -22,6 +19,7 @@ $Watcher = $null
 $RunLock = "$RemoteHome/.r1-live.lock"
 $LockOwned = $false
 $Completed = $false
+$Evidence = $null
 
 function Invoke-Node {
     param(
@@ -99,7 +97,7 @@ if (-not (Test-Path $LocalPy)) {
     throw "找不到 $LocalPy"
 }
 if (-not (Test-Path $KeyA) -or -not (Test-Path $KeyB)) {
-    throw "缺少 SSH 私钥。165 用 id_ed25519，125 用 id_rsa。"
+    throw "缺少配置的 SSH 私钥。"
 }
 
 try {
@@ -110,13 +108,13 @@ try {
     Copy-Between $KeyA $LocalPy "${IpA}:$RemotePy"
     Copy-Between $KeyB $LocalPy "${IpB}:$RemotePy"
 
-    Write-Host "检查 165 上的源码和空集群"
-    Invoke-Node $IpA $KeyA "python3 -u $RemotePy precheck"
+    Write-Host "检查 node-a 上的源码和空集群"
+    Invoke-Node $IpA $KeyA "env $RemoteEnv python3 -u $RemotePy precheck"
     $Evidence = Read-Evidence
     Write-Host "证据目录 $Evidence"
 
     Write-Host "编译当前源码"
-    Invoke-Node $IpA $KeyA "python3 -u $RemotePy build"
+    Invoke-Node $IpA $KeyA "env $RemoteEnv python3 -u $RemotePy build"
 
     $Stamp = [guid]::NewGuid().ToString("N")
     $ProxyLocal = Join-Path $env:TEMP "mini-proxy.g5cur.$Stamp"
@@ -139,29 +137,29 @@ try {
     Write-Host "proxy 和检查程序已复制到 node-b"
 
     Write-Host ""
-    Write-Host "第 1 次 sudo：10.128.176.165。只换本机 proxy，并核对镜像和租约。"
-    Invoke-Node $IpA $KeyA "sudo python3 -u $RemotePy prepare-a" -Tty
+    Write-Host "第 1 次 sudo：$IpA。只换本机 proxy，并核对镜像和租约。"
+    Invoke-Node $IpA $KeyA "sudo env $RemoteEnv python3 -u $RemotePy prepare-a" -Tty
 
     Write-Host ""
-    Write-Host "第 2 次 sudo：10.128.176.125。换 proxy，核对镜像和租约，留下只做 hairpin 和快照的 root 进程。"
+    Write-Host "第 2 次 sudo：$IpB。换 proxy，核对镜像和租约，留下只做 hairpin 和快照的 root 进程。"
     $ManifestText = (& ssh -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpA "cat $Evidence/g4-manifest.json" | Out-String)
     if ($LASTEXITCODE -ne 0) { throw "无法读取 G4 构建清单" }
     $AgentHash = ($ManifestText | ConvertFrom-Json).sha256.'mini-agent'
     if ($AgentHash -notmatch '^[0-9a-f]{64}$') { throw "G4 Agent 摘要无效" }
-    Invoke-Node $IpB $KeyB "sudo python3 -u $RemotePy prepare-b $AgentHash" -Tty
+    Invoke-Node $IpB $KeyB "sudo env $RemoteEnv python3 -u $RemotePy prepare-b $AgentHash" -Tty
     $Baseline = Join-Path $env:TEMP "g5cur-baseline-b.json"
     Copy-Between $KeyB "${IpB}:/tmp/g5cur-baseline-b.json" $Baseline
     Copy-Between $KeyA $Baseline "${IpA}:$Evidence/baseline-b.json"
 
     $Watcher = Start-Job -Name g5curWatch -ScriptBlock {
-        param($KeyA, $KeyB, $IpA, $IpB, $RemotePy)
+        param($KeyA, $KeyB, $IpA, $IpB, $RemotePy, $RemoteEnv, $RemoteHome)
         $ErrorActionPreference = "Continue"
         $optsA = @("-i", $KeyA, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-T")
         $optsB = @("-i", $KeyB, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new", "-T")
         $seen = ""
         $log = Join-Path $env:TEMP "g5cur-watcher.log"
         while ($true) {
-            $raw = & ssh @optsA $IpA "cat /home/lihaoyang/mini-k8s-g4/g5cur-request.json 2>/dev/null || true"
+            $raw = & ssh @optsA $IpA "cat $RemoteHome/g5cur-request.json 2>/dev/null || true"
             $text = ($raw | Out-String).Trim()
             if (-not $text.StartsWith("{")) {
                 Start-Sleep -Milliseconds 300
@@ -179,7 +177,7 @@ try {
             $payload = "{}"
             if ($req.payload) { $payload = $req.payload | ConvertTo-Json -Compress -Depth 8 }
             $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload))
-            $remote = "python3 -u $RemotePy $($req.action) '$b64'"
+            $remote = "env $RemoteEnv python3 -u $RemotePy $($req.action) '$b64'"
             Add-Content -Path $log -Value ("---- " + $req.action)
             $out = & ssh @optsB $IpB $remote 2>&1 | Out-String
             $ok = $LASTEXITCODE -eq 0
@@ -188,15 +186,15 @@ try {
             $tmp = Join-Path $env:TEMP "g5cur-ack.json"
             $utf8 = New-Object System.Text.UTF8Encoding $false
             [System.IO.File]::WriteAllText($tmp, $ack, $utf8)
-            & scp -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new $tmp "${IpA}:/home/lihaoyang/mini-k8s-g4/g5cur-ack.tmp"
-            & ssh @optsA $IpA "mv -f /home/lihaoyang/mini-k8s-g4/g5cur-ack.tmp /home/lihaoyang/mini-k8s-g4/g5cur-ack.json"
+            & scp -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new $tmp "${IpA}:$RemoteHome/g5cur-ack.tmp"
+            & ssh @optsA $IpA "mv -f $RemoteHome/g5cur-ack.tmp $RemoteHome/g5cur-ack.json"
         }
-    } -ArgumentList $KeyA, $KeyB, $IpA, $IpB, $RemotePy
+    } -ArgumentList $KeyA, $KeyB, $IpA, $IpB, $RemotePy, $RemoteEnv, $RemoteHome
 
     Write-Host ""
-    Write-Host "第 3 次 sudo：10.128.176.165。输入密码之后不需要再操作。"
+    Write-Host "第 3 次 sudo：$IpA。输入密码之后不需要再操作。"
     Write-Host "G5-06 会稳定 5 分钟，大约每分钟打印一行。"
-    Invoke-Node $IpA $KeyA "python3 -u $RemotePy driver" -Tty
+    Invoke-Node $IpA $KeyA "env $RemoteEnv python3 -u $RemotePy driver" -Tty
     $Completed = $true
     Write-Host ""
     Write-Host "跑完了。把上面的 G5-01 到 G5-07 结果发回来。这还不是 mini demo 验收通过。"
@@ -211,7 +209,7 @@ finally {
         $etcdDown = (& ssh -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpA "if test -f $EtcdFlag; then echo DOWN; fi" | Out-String)
         if ($etcdDown -match "DOWN") {
             Write-Host "场景中断，正在恢复 etcd"
-            & ssh -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpA "python3 -u $RemotePy recover-etcd"
+            & ssh -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpA "env $RemoteEnv python3 -u $RemotePy recover-etcd"
         }
     } catch {
         Write-Host "恢复 etcd 时出错"
@@ -220,7 +218,7 @@ finally {
         $fwdDown = (& ssh -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpA "if test -f $FwdFlag; then echo DOWN; fi" | Out-String)
         if ($fwdDown -match "DOWN") {
             Write-Host "场景中断，正在恢复 node-b 转发"
-            & ssh -i $KeyB -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpB "python3 -u $RemotePy start-forwarder"
+            & ssh -i $KeyB -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpB "env $RemoteEnv python3 -u $RemotePy start-forwarder"
             if ($LASTEXITCODE -ne 0) { throw "node-b 转发恢复失败，保留故障标记" }
             & ssh -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpA "rm -f $FwdFlag"
         }
@@ -231,7 +229,7 @@ finally {
         foreach ($target in @(@($IpA, $KeyA), @($IpB, $KeyB))) {
             Write-Host "尝试恢复 $($target[0]) 原 proxy；失败时保留现场和运行锁"
             try {
-                Invoke-Node $target[0] $target[1] "sudo python3 -u $RemotePy rollback-proxy" -Tty
+                Invoke-Node $target[0] $target[1] "sudo env $RemoteEnv python3 -u $RemotePy rollback-proxy" -Tty
             } catch {
                 Write-Host "原 proxy 未确认恢复：$($target[0])"
             }
@@ -242,15 +240,17 @@ finally {
     } catch {
         Write-Host "没有停掉 node-b 的取证进程"
     }
-    try {
-        & ssh -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpA "python3 -u $RemotePy report"
-    } catch {
+    if ($Evidence) {
+        try {
+            & ssh -i $KeyA -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -T $IpA "env $RemoteEnv python3 -u $RemotePy report"
+        } catch {
+        }
     }
     if ($LockOwned -and $Completed) {
         foreach ($target in @(@($IpA, $KeyA), @($IpB, $KeyB))) {
             try {
                 Write-Host "核对 $($target[0]) 的 proxy，可能需要输入 sudo 密码。"
-                Invoke-Node $target[0] $target[1] "sudo python3 -u $RemotePy finalize-proxy" -Tty
+                Invoke-Node $target[0] $target[1] "sudo env $RemoteEnv python3 -u $RemotePy finalize-proxy" -Tty
             } catch {
                 $Completed = $false
                 Write-Host "proxy 身份未确认，运行锁已保留：$($target[0])"

@@ -1,44 +1,103 @@
 # Mini K8s
 
-一个用于学习容器编排的精简项目：使用 Go 实现声明式 API、控制器、调度器和节点 Agent，并使用 etcd 保存状态、通过 CRI 接入 containerd。项目是受限演示，不兼容 Kubernetes API 或 `kubectl`，也不用于生产环境。
+Mini K8s 是一个用 Go 写的容器编排实验。仓库里有自定义 API、命令行、控制器、调度器和节点进程。提交一个 ReplicaSet 后，可以沿着代码看它如何创建 Pod、选择节点、启动容器，再通过 ClusterIP 接收流量。
 
-## 项目结构
+演示环境是一套控制面、单成员 etcd 和两台 Linux Worker。资源范围是 `default` 命名空间下的无状态单容器 Pod、ReplicaSet 和单 TCP 端口 Service。代码中的资源名借鉴 Kubernetes，示例使用仓库自带的 `mini-k8s` 命令。 [与 Kubernetes 的能力对照](docs/mini-k8s-管理层汇报.md#和-kubernetes-相比首版做到哪里)
 
-```text
-cmd/                  各组件的启动入口和验收用探针
-internal/api/         资源模型与校验
-internal/server/      API、etcd 持久化、调度绑定和状态管理
-internal/controller/  ReplicaSet 对账
-internal/scheduler/   节点选择与调度
-internal/agent/       节点心跳、Pod 对账和就绪探测
-internal/runtime/     CRI 容器生命周期及资源清理
-internal/proxy/       Service 端点与 iptables 转发规则
-internal/cli/         mini-k8s 命令行客户端
-internal/acceptance/  真实 API 和运行时的阶段验收测试
-scripts/acceptance/   各阶段验收与取证辅助脚本
-examples/             示例资源清单
-docs/                 开发、部署、排障和验收说明
-artifacts/acceptance/ 验收运行产生的报告和证据
+## 组件怎么连接
+
+```mermaid
+flowchart LR
+    CLI(["mini-k8s CLI"]) -->|提交声明| API
+
+    subgraph CP["控制面"]
+        API["mini-api<br/>校验与存储"]
+        DB[("etcd")]
+        Controller["mini-manager<br/>副本对账"]
+        Scheduler["mini-scheduler<br/>节点放置"]
+        API <--> DB
+        Controller <--> API
+        Scheduler <--> API
+    end
+
+    subgraph Worker["每台 Linux Worker"]
+        Agent["mini-agent"] -->|CRI| Runtime["containerd + CNI"]
+        Runtime --> Pod(["就绪 Pod"])
+        Proxy["mini-proxy"] -->|更新| Rules["iptables 规则"]
+    end
+
+    API <-->|任务与状态| Agent
+    API <-->|资源查询| Proxy
+    Client(["客户端"]) -. ClusterIP .-> Rules
+    Rules -.-> Pod
+
+    classDef control fill:#eaf2ff,stroke:#4c76ae,color:#16345c,stroke-width:1.5px
+    classDef runtime fill:#e8f6ee,stroke:#418060,color:#193f2e,stroke-width:1.5px
+    classDef traffic fill:#fff2df,stroke:#ba6b26,color:#573712,stroke-width:1.5px
+    classDef input fill:#f2edf9,stroke:#7b659b,color:#3f2d57,stroke-width:1.5px
+    class API,DB,Controller,Scheduler control
+    class Agent,Runtime,Proxy runtime
+    class Client,Rules,Pod traffic
+    class CLI input
+    style CP fill:transparent,stroke:#6e91ba,stroke-width:1.5px
+    style Worker fill:transparent,stroke:#629680,stroke-width:1.5px
+    %% 最后两条边是业务流量
+    linkStyle 9,10 stroke:#ba6b26,stroke-width:2.5px
 ```
 
-建议先从 `internal/api` 的资源模型读起，再按 API、Controller、Scheduler、Agent 和 Proxy 的数据流阅读；组件配置与双节点部署见[运行与排障指南](docs/operations.md)。
+蓝色是控制面，绿色是 Worker 上的组件，橙色虚线表示业务流量。API Server 直接读写 etcd，其余组件通过 HTTPS API 交换状态。iptables 规则把新连接转发到本机或对端 Worker 的就绪 Pod。
 
-## 当前验收状态
+## 一次部署怎么走
 
-G1–G5 是循序实施的 demo 阶段，验收依据是 [Gateway.md](Gateway.md)。已有 G1–G3 通过记录，以及同一源码校验值下 G4-01–06、G5-01–07 的脚本 PASS 记录；各轮证据与剩余交付条件见[验收总览](docs/acceptance-overview.md)。
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CLI as mini-k8s
+    participant API as mini-api
+    participant C as Controller
+    participant S as Scheduler
+    participant A as Agent
+    participant P as Proxy
 
-当前 Service 实现会保留已删除 Service 的 ClusterIP 声明，以避免失联 Proxy 使用旧规则时地址复用；地址池不会自动回收，容量可能耗尽。节点失联、单成员 etcd、审计和灾备的限制见计划及运行文档，不应将 demo 验收与 PRD 全部能力完成等同。
+    rect rgba(76, 118, 174, 0.12)
+        Note over CLI,C: 提交声明
+        CLI->>API: 提交 ReplicaSet 和 Service
+        C->>API: 按期望副本数创建缺少的 Pod
+    end
 
-## 快速开始
+    rect rgba(65, 128, 96, 0.12)
+        Note over S,A: 调度与就绪
+        S->>API: 提交节点绑定和资源预留
+        A->>API: 读取分配给本节点的 Pod
+        Note right of A: 通过 CRI 启动容器并探测就绪
+        A->>API: 上报运行状态和 Ready
+    end
 
-1. 本地构建和检查 Go 代码，见下节。
-2. 准备 Linux Worker、CRI/CNI 和双向路由，按 [两节点运行与排障指南](docs/operations.md) 启动各组件。
-3. 按运行指南部署 [ReplicaSet](examples/g5-replicaset.yaml) 和 [Service](examples/g5-service.yaml)，访问 ClusterIP，再缩容和清理示例资源。
-4. 对照 [验收总览](docs/acceptance-overview.md) 选择场景、记录源码版本并保存证据。
+    rect rgba(186, 107, 38, 0.12)
+        Note over API,P: 更新转发
+        P->>API: 读取 Service、Pod 和 Node
+        Note right of P: 将就绪端点写入 ClusterIP 转发规则
+    end
+```
 
-## 开发与验证
+部署过程中，Pod 绑定和 CPU、内存预留在同一个 etcd 事务中提交。节点失联时，调度器停止向它绑定新 Pod，Proxy 摘除它的端点，Controller 继续计入尚未确认停止的旧实例。
 
-项目使用 Go，依赖版本见 [go.mod](go.mod)。在仓库根目录可执行以下常规代码检查：
+## 从哪里读代码
+
+可从 [ReplicaSet 示例](examples/g5-replicaset.yaml) 和 [Service 示例](examples/g5-service.yaml) 开始，沿着上图查对应的进程入口和实现。
+
+| 环节 | 进程入口 | 实现 |
+| --- | --- | --- |
+| 提交声明 | [cmd/mini-k8s](cmd/mini-k8s) | [internal/cli](internal/cli) 解析 YAML、调用 API |
+| 存取资源 | [cmd/mini-api](cmd/mini-api) | [internal/api](internal/api) 定义资源和校验，[internal/server](internal/server) 处理身份、资源读写与事务 |
+| 管理副本 | [cmd/mini-manager](cmd/mini-manager) | [internal/controller](internal/controller) 按所有者 UID 对账 |
+| 放置 Pod | [cmd/mini-scheduler](cmd/mini-scheduler) | [internal/scheduler](internal/scheduler) 按 CPU、内存请求选节点 |
+| 运行容器 | [cmd/mini-agent](cmd/mini-agent) | [internal/agent](internal/agent) 管理本节点 Pod，[internal/runtime](internal/runtime) 封装 CRI 操作 |
+| 转发流量 | [cmd/mini-proxy](cmd/mini-proxy) | [internal/proxy](internal/proxy) 计算就绪端点、更新 iptables |
+
+## 构建与验收
+
+用 Go 1.23 或更高版本在仓库根目录构建和检查。
 
 ```sh
 gofmt -l cmd internal
@@ -47,34 +106,22 @@ go test ./...
 go build ./...
 ```
 
-这些命令不能替代真实环境验收。G3–G5 涉及 Linux、containerd CRI、CNI、网络及权限；启动组件、准备镜像和安全取证的步骤见[运行与排障指南](docs/operations.md)。`g4.sh` 仅提供预检，不单独判定 G4 通过；G5 的 API 采样脚本也不自动判定整门 Gate。运行验收前先核对脚本适用的节点、配置和影响范围，避免操作已有工作负载。
+运行双节点演示时，先准备 etcd、两台 Linux Worker、containerd、CNI 和双向路由，再按手册启动组件、部署示例、访问 ClusterIP，最后缩容和清理。验收前确认脚本指向独立测试环境。 [两节点运行与排障指南](docs/operations.md)
 
-## 项目文档
+G1～G5 已通过。最近一轮双节点验收中，20 个 Pod 用时 7.3 秒全部 Ready，稳定运行 5 分钟后完成缩容和清理。R2-A1 的过载验证也已通过，普通 API 请求返回 429 时，两台 Agent 仍能上报心跳并完成测试 Pod 清理。
 
-- [产品需求与边界](PRD.md)
-- [分阶段实现计划](Plan.md)
-- [各阶段验收标准](Gateway.md)
-- [验收总览与证据说明](docs/acceptance-overview.md)
-- [开发与代码阅读指南](docs/development.md)
-- [G1 控制面启动与操作说明](docs/g1.md)
-- [G2 副本控制器说明](docs/g2.md)
-- [G3 单节点 Agent 说明](docs/g3.md)
-- [G4 两节点调度与验收说明](docs/g4.md)
-- [G5 readiness 验收说明](docs/g5-readiness.md)
-- [G5 Service 验收说明](docs/g5-service.md)
-- [G5 证据核对与补采](docs/g5-evidence-reconciliation.md)
-- [后续可靠性设计草案](docs/reliability-roadmap.md)
-- [R1 详细设计与状态](docs/r1-reliability-design.md)
-- [两节点运行与排障指南](docs/operations.md)（控制面和示例步骤已在当前源码上执行；Worker 步骤未在占用中的集群上再启动）
+Service 删除后会保留 ClusterIP 声明，避免失联 Proxy 的旧规则命中复用地址。长期反复创建和删除 Service 可能耗尽地址池。 [Service 设计](docs/g5-service.md)
 
-计划依次完成最小控制面（G1）、副本对账（G2）、单节点运行时（G3）、两节点调度（G4）和 Service 演示（G5）。每阶段按对应 Gateway 验收；未运行或缺少真实环境的检查不能视为通过。
+## 文档索引
 
-## 设计要点
-
-- API 是唯一访问 etcd 的业务组件，使用资源版本和 CAS 处理并发更新，通过 List/Watch 同步状态。
-- Controller 根据期望状态持续对账，按资源 UID 区分所有权，避免重复创建和误删。
-- Agent 通过 CRI 操作 containerd，并复用 CNI；不直接调用 Docker API。
-- CPU、内存预留与绑定原子提交；节点失联时保守处理尚未确认停止的实例。
-- 控制面和运行时的恢复以可验证的真实环境测试为准。完整审计、灾备和生产级高可用等要求见 PRD，不能仅凭 demo 阶段通过而宣称完成。
-
-初始设计记录：2026-11-03，howyangli。
+| 想查什么 | 文档 |
+| --- | --- |
+| 项目范围、阶段计划和设计取舍 | [PRD](PRD.md) · [实施计划](Plan.md) · [项目汇报](docs/mini-k8s-管理层汇报.md) |
+| 运行和排障 | [G1 本地启动](docs/g1.md) · [两节点运行与排障](docs/operations.md) |
+| 代码约定和修改前检查 | [开发指南](docs/development.md) · [仓库 Agent 工作说明](AGENT.md) |
+| 副本对账、容器运行和节点调度 | [G2 副本控制器](docs/g2.md) · [G3 Agent 与运行时](docs/g3.md) · [G4 双节点调度](docs/g4.md) |
+| Service 和就绪探测 | [G5 TCP 就绪探测](docs/g5-readiness.md) · [G5 Service](docs/g5-service.md) |
+| 验收条件与执行入口 | [验收标准](Gateway.md) · [验收脚本](scripts/acceptance) |
+| 验收结果与历史记录 | [本轮验收结果与证据](docs/mini-k8s-验收结果与证据.md) · [阶段验收总览与历史图表](docs/acceptance-overview.md) · [早期 G5 证据核对](docs/g5-evidence-reconciliation.md) |
+| R1 幂等与容量采样 | [R1 设计与验收](docs/r1-reliability-design.md) · [只读基线采集](docs/r1-baseline.md) · [只读采样记录](docs/r1-baseline-results.md) |
+| R2 过载保护和后续工作 | [R2 实施与验收](docs/r2-implementation-plan.md) · [可靠性路线图](docs/reliability-roadmap.md) |

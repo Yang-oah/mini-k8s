@@ -38,6 +38,7 @@ type Server struct {
 	Log         *slog.Logger
 	// ServiceCIDR 必须显式配置；创建 Service 时持久化并固定该地址池。
 	ServiceCIDR string
+	Admission   *Admission
 }
 
 type identity struct{ role, node string }
@@ -162,6 +163,10 @@ func resourceKey(kind, name string) string { return prefix + kind + "/" + name }
 // Watch 是长连接，不适用这个期限。
 const requestTimeout = 4 * time.Second
 
+// Limit body reads separately: cancelling an HTTP request context does not
+// interrupt a client that stops sending its request body.
+const requestBodyTimeout = 10 * time.Second
+
 // 只有资源集合的 Watch 才是长连接；普通接口不能借查询参数绕过期限。
 func isWatchRequest(r *http.Request) bool {
 	if r.Method != http.MethodGet || r.URL.Query().Get("watch") != "true" {
@@ -197,8 +202,33 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}()
 	respondError := func(code int, reason, msg string) { status = code; writeAPIError(w, code, reason, msg, id) }
 	if who.role == "" {
+		// HTTP/1 may otherwise wait for an unread body before sending the 401.
+		if r.ProtoMajor == 1 && r.Body != nil && r.Body != http.NoBody {
+			w.Header().Set("Connection", "close")
+		}
 		respondError(401, "Unauthorized", "authentication required")
 		return
+	}
+	if s.Admission != nil {
+		category := admissionCategory(r, who)
+		release, ok := s.Admission.acquire(category)
+		if !ok {
+			// net/http may drain an unread HTTP/1 body before sending a response.
+			// Closing the connection avoids making an overload response wait on it.
+			if r.ProtoMajor == 1 && r.Body != nil && r.Body != http.NoBody {
+				w.Header().Set("Connection", "close")
+			}
+			respondError(http.StatusTooManyRequests, "TooManyRequests", "request budget exhausted: "+category)
+			return
+		}
+		defer release()
+		if r.Body != nil && r.Body != http.NoBody {
+			controller := http.NewResponseController(w)
+			if err := controller.SetReadDeadline(start.Add(requestBodyTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+				respondError(http.StatusInternalServerError, "Internal", "request body deadline unavailable")
+				return
+			}
+		}
 	}
 	path := strings.TrimPrefix(r.URL.Path, "/api/mini/v1/")
 	if path == r.URL.Path {
